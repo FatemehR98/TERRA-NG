@@ -195,6 +195,14 @@ Result<> run( const Parameters& prm )
     Grid2DDataScalar< ScalarType > kappa_profile(
         "kappa_profile", coords_radii[velocity_level].extent( 0 ), coords_radii[velocity_level].extent( 1 ) );
 
+    Grid2DDataScalar< ScalarType > diffusion_coeff_profile(
+        "diffusion_coeff_profile", coords_radii[velocity_level].extent( 0 ), coords_radii[velocity_level].extent( 1 ) );
+    Grid2DDataScalar< ScalarType > adiabatic_heating_coeff_profile(
+        "adiabatic_heating_coeff_profile", coords_radii[velocity_level].extent( 0 ), coords_radii[velocity_level].extent( 1 ) );
+    Grid2DDataScalar< ScalarType > shear_heating_coeff_profile(
+        "shear_heating_coeff_profile", coords_radii[velocity_level].extent( 0 ), coords_radii[velocity_level].extent( 1 ) );    
+    Grid2DDataScalar< ScalarType > internal_heating_coeff_profile(
+        "internal_heating_coeff_profile", coords_radii[velocity_level].extent( 0 ), coords_radii[velocity_level].extent( 1 ) );
     // Finite-volume functions/vectors.
 
     // FV cell-centred temperature field (the FCT prognostic variable).
@@ -238,6 +246,14 @@ Result<> run( const Parameters& prm )
         *domains[velocity_level],
         coords_radii[velocity_level],
         prm );
+
+    Kokkos::parallel_for(
+        "compute diffusion_profile",
+        grid::shell::local_domain_md_range_policy_radial( domain ),
+        KOKKOS_LAMBDA( int id, int r ) {
+            diffusion_coeff_profile( id, r ) = kappa_profile( id, r ) / ( rho_profile( id, r ) * cp_profile( id, r ) );
+        } );
+    Kokkos::fence();
 
     // Initialise density Q1 field from radial profile -- before Stokes solver setup
     if ( pda_form )
@@ -485,6 +501,10 @@ Result<> run( const Parameters& prm )
             ownership_mask_data[velocity_level],
             u.block_1(),
             T,
+            rho_profile,
+            rho_profile,
+            rho_profile,
+            rho_profile,
             h,
             prm,
             table );

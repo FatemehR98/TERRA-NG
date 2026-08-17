@@ -391,6 +391,10 @@ class EVSolver : public EnergySolver< ScalarType >
         const grid::Grid4DDataScalar< grid::NodeOwnershipFlag >&        ownership_mask,
         const linalg::VectorQ1Vec< ScalarType, 3 >&                     velocity,
         linalg::VectorQ1Scalar< ScalarType >&                           T,
+        const grid::Grid2DDataScalar< ScalarType >&                     diffusion_coeff,
+        const grid::Grid2DDataScalar< ScalarType >&                     adiabatic_heating_coeff,
+        const grid::Grid2DDataScalar< ScalarType >&                     shear_heating_coeff,
+        const grid::Grid2DDataScalar< ScalarType >&                     internal_heating_coeff,
         ScalarType                                                      h,
         const Parameters&                                               prm,
         std::shared_ptr< util::Table >                                  table )
@@ -401,6 +405,10 @@ class EVSolver : public EnergySolver< ScalarType >
     , ownership_mask_( ownership_mask )
     , velocity_( velocity )
     , T_( T )
+    , diffusion_coeff_( diffusion_coeff )
+    , adiabatic_heating_coeff_( adiabatic_heating_coeff )
+    , shear_heating_coeff_( shear_heating_coeff )
+    , internal_heating_coeff_( internal_heating_coeff )
     , h_( h )
     , prm_( prm )
     , table_( std::move( table ) )
@@ -481,11 +489,17 @@ class EVSolver : public EnergySolver< ScalarType >
         // stored — giving the standard ∫ κ ∇φ_i · ∇φ_j with additive halo exchange.
         if ( prm_.devel_parameters.extended_diagnostics )
             log_hbm( "EV: + nu_h_wedge (1 Grid5D per-wedge field; kappa is a scalar)" );
+        // A_kappa_ = std::make_unique< EVDiffOp >(
+        //     *domain_,
+        //     coords_shell_,
+        //     coords_radii_,
+        //     static_cast< ScalarType >( prm_.physics_parameters.thermal_diffusivity_nondim ) );
+
         A_kappa_ = std::make_unique< EVDiffOp >(
             *domain_,
             coords_shell_,
             coords_radii_,
-            static_cast< ScalarType >( prm_.physics_parameters.thermal_diffusivity_nondim ) );
+            diffusion_coeff_ );
 
         // Global lumped mass M_lumped = M · 1, used to invert the global
         // Galerkin K·T into a Q1-nodal lap field per timestep:
@@ -1013,6 +1027,10 @@ class EVSolver : public EnergySolver< ScalarType >
     const grid::Grid4DDataScalar< grid::NodeOwnershipFlag >&        ownership_mask_;
     const linalg::VectorQ1Vec< ScalarType, 3 >&                     velocity_;
     linalg::VectorQ1Scalar< ScalarType >&                           T_;
+    const grid::Grid2DDataScalar< ScalarType >&                     diffusion_coeff_;
+    const grid::Grid2DDataScalar< ScalarType >&                     adiabatic_heating_coeff_;
+    const grid::Grid2DDataScalar< ScalarType >&                     shear_heating_coeff_;
+    const grid::Grid2DDataScalar< ScalarType >&                     internal_heating_coeff_;
     ScalarType                                                      h_;
     const Parameters&                                               prm_;
     std::shared_ptr< util::Table >                                  table_;

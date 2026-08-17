@@ -872,7 +872,7 @@ int main( int argc, char** argv )
     MPI_Init( &argc, &argv );
     Kokkos::ScopeGuard scope_guard( argc, argv );
 
-    const int max_level = 6;
+    const int max_level = 3;
     auto      table     = std::make_shared< util::Table >();
 
     std::vector< int > gcas = { 0 };

@@ -146,6 +146,26 @@ ScalarType max_entry_nodes( const Grid4DDataScalar< ScalarType >& x )
     return max_val;
 }
 
+struct ZeroCallback
+{
+    double zero_;
+
+    KOKKOS_INLINE_FUNCTION double operator()(
+        const int local_subdomain_id, const int x_cell, const int y_cell, const int r_cell, const int wedge, const dense::Vec< double, 3 > qp
+    ) const
+    {
+        return zero_;
+    }
+};
+
+struct CoeffConfigT 
+{
+    using DiffusionCoeffT        = ZeroCallback;
+    using InternalHeatingCoeffT  = ZeroCallback;
+    using AdiabaticHeatingCoeffT = ZeroCallback;
+    using ShearHeatingCoeffT     = ZeroCallback;
+};
+
 int test( const int level )
 {
     const auto domain = DistributedDomain::create_uniform_single_subdomain_per_diamond( level, level, 0.5, 1.0 );
@@ -164,6 +184,9 @@ int test( const int level )
     VectorQ1Scalar< ScalarType > rhs_ev( "rhs_ev", domain, mask_data );
     VectorQ1Scalar< ScalarType > lap_T( "lap_T", domain, mask_data );
     VectorQ1Scalar< ScalarType > M_lumped( "M_lumped", domain, mask_data );
+
+    VectorQ1Scalar< ScalarType > eta_shear( "eta_shear", domain, mask_data );
+    linalg::assign( eta_shear, ScalarType( 0 ) );
 
     // Per-wedge ν_h field (new EV API): extents (n_sub, N-1, N-1, N_r-1, num_wedges).
     const auto num_sub = static_cast< long long >( domain.subdomains().size() );
@@ -245,7 +268,7 @@ int test( const int level )
     constexpr int vtk_interval = 10;
     io::XDMFOutput xdmf( "test_ev_rotation_out", domain, coords_shell, coords_radii );
     xdmf.add( T.grid_data() );
-    xdmf.write();
+    xdmf.write(0);
 
     util::logroot << "Running EV rotation test"
                   << "  level=" << level << "  dt=" << dt
@@ -284,9 +307,9 @@ int test( const int level )
         // 2) entropy stats and ν_h per wedge.
         const auto stats = fe::wedge::operators::shell::compute_entropy_stats(
             T, mask_data, domain, coords_shell, coords_radii, ev_params );
-        fe::wedge::operators::shell::compute_nu_h(
-            nu_h_wedge, T, T_prev, u, lap_T.grid_data(),
-            domain, coords_shell, coords_radii, dt, stats, ev_params );
+        fe::wedge::operators::shell::compute_nu_h<double, CoeffConfigT>(
+            nu_h_wedge, T, T_prev, eta_shear, u, lap_T.grid_data(),
+            domain, coords_shell, coords_radii, dt, stats, ev_params, ZeroCallback(0.0), ZeroCallback(0.0), ZeroCallback(0.0), ZeroCallback(0.0) );
 
         // 3) rhs_ev = ∫ ν_h ∇T · ∇φ_i  (explicit EV stabilization).
         linalg::apply( A_evdiff, T, rhs_ev );
@@ -314,13 +337,13 @@ int test( const int level )
 
         if ( ts % vtk_interval == 0 )
         {
-            xdmf.write();
+            xdmf.write(0);
             util::logroot << "  ts=" << ts << "  t=" << ts * dt
                           << "  l2_rel_err=" << l2_rel_err
                           << "  T_min=" << t_min_step << "  T_max=" << t_max_step << "\n";
         }
     }
-    xdmf.write();
+    xdmf.write(0);
 
     const ScalarType final_l2_rel = compute_l2_relative_error_nodes( T.grid_data(), T_ref.grid_data(), mask_data );
 

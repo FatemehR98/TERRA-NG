@@ -49,6 +49,7 @@
 #include "src/parameters.hpp"
 #include "src/stokes_solver.hpp"
 #include "src/temperature_init.hpp"
+#include "src/utils/energy_coefficients.hpp"
 #include "util/bit_masking.hpp"
 #include "util/filesystem.hpp"
 #include "util/logging.hpp"
@@ -178,7 +179,7 @@ Result<> run( const Parameters& prm )
     // Optional 3-D density field for PDA
     // Density is needed in Stokes and energy -- so we set it up here
     std::optional< VectorQ1Scalar< ScalarType > > density;
-    if ( pda_form )
+    // if ( pda_form )
     {
         density.emplace( "density", ( *domains[velocity_level] ), ownership_mask_data[velocity_level] );
     }
@@ -264,6 +265,12 @@ Result<> run( const Parameters& prm )
             RadialProfileToQ1{ density->grid_data(), rho_profile } );
         Kokkos::fence();
     }
+
+    Kokkos::parallel_for(
+        "RadialProfileToQ1",
+        grid::shell::local_domain_md_range_policy_nodes( *domains[velocity_level] ),
+        RadialProfileToQ1{ density->grid_data(), rho_profile } );
+    Kokkos::fence();
 
     // Setting up Stokes velocity boundary conditions.
     //
@@ -360,8 +367,10 @@ Result<> run( const Parameters& prm )
     xdmf_output->add( Tdev.grid_data() );              // Temperature deviation
     xdmf_output->add( u.block_1().grid_data() );       // Velocity
     xdmf_output->add( stokes.eta_fine().grid_data() ); // Viscosity
-    if ( pda_form )
+    // if ( pda_form )
+    {
         xdmf_output->add( density->grid_data() ); // Density
+    }
 
     if ( prm.io_parameters.output_pressure )
     {
@@ -472,6 +481,11 @@ Result<> run( const Parameters& prm )
     // radial direction.
     const auto h = grid::shell::min_radial_h( domains[velocity_level]->domain_info().radii() );
 
+    const ScalarType gamma =
+        prm.physics_parameters.internal_heating ?
+            static_cast< ScalarType >( prm.physics_parameters.h_number / prm.physics_parameters.cp_profile ) :
+            ScalarType( 0 );
+
     // --- Energy solver (polymorphic dispatch via EnergySolver) ---
     // Construct before the initial XDMF write so that EV's optional
     // nu_h_nodal_view() can be registered with the XDMF output.
@@ -492,23 +506,46 @@ Result<> run( const Parameters& prm )
             prm,
             table );
         break;
-    case EnergySolverType::ENTROPY_VISCOSITY:
-        energy = std::make_unique< EVSolver< ScalarType > >(
+    case EnergySolverType::ENTROPY_VISCOSITY: {
+        using EnergyEqnCoeffT = EnergyEquationCoeffT< DiffusionCoefficient, InternalHeatingCoefficient, AdiabaticCoefficient, ShearHeatingCoefficient >;
+
+        const auto diffusion_coefficient =
+            DiffusionCoefficient( prm.physics_parameters.peclet_number, rho_profile, cp_profile, coords_radii[velocity_level] );
+
+        const auto internal_heating_coefficient =
+            InternalHeatingCoefficient( prm.physics_parameters.internal_heating, prm.physics_parameters.h_number, cp_profile, coords_radii[velocity_level] );
+
+        const auto adiabatic_heating_coefficient = AdiabaticCoefficient( prm.physics_parameters.compressible,
+            prm.physics_parameters.dissipation_number, alpha_profile, cp_profile, coords_radii[velocity_level] );
+
+        const auto shear_heating_coefficient = ShearHeatingCoefficient(
+            prm.physics_parameters.shear_heating,
+            prm.physics_parameters.dissipation_number,
+            prm.physics_parameters.peclet_number,
+            prm.physics_parameters.rayleigh_number,
+            rho_profile,
+            cp_profile,
+            coords_radii[velocity_level] );
+
+        energy = std::make_unique< EVSolver< ScalarType, EnergyEqnCoeffT > >(
             domains[velocity_level],
             coords_shell[velocity_level],
             coords_radii[velocity_level],
             boundary_mask_data[velocity_level],
             ownership_mask_data[velocity_level],
+            stokes.eta_fine(),
             u.block_1(),
             T,
-            rho_profile,
-            rho_profile,
-            rho_profile,
-            rho_profile,
+            diffusion_coefficient,
+            prm.physics_parameters.thermal_diffusivity_nondim,
+            internal_heating_coefficient,
+            adiabatic_heating_coefficient,
+            shear_heating_coefficient,
             h,
             prm,
             table );
-        break;
+    }
+    break;
     case EnergySolverType::FCT:
         energy = std::make_unique< FCTSolver< ScalarType > >(
             domains[velocity_level],

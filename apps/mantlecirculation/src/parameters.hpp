@@ -202,6 +202,8 @@ struct PhysicsParameters
     bool   internal_heating      = false;
     double internal_heating_rate = 3e-12;
 
+    bool shear_heating = false;
+
     bool             compressible      = false;
     CompressibleForm compressible_form = CompressibleForm::TALA;
 

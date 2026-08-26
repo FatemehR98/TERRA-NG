@@ -378,8 +378,10 @@ class EVSolver : public EnergySolver< ScalarType >
     using TempMass = fe::wedge::operators::shell::Mass< ScalarType >;
     using KMassType =
         terra::fe::wedge::operators::shell::KMass< ScalarType, typename CoeffType::InternalHeatingCoeffT >;
-    using EVDiffOp =
+    using DiffOp =
         fe::wedge::operators::shell::WedgeConstantDivKGrad< ScalarType, typename CoeffType::DiffusionCoeffT >;
+    using EVDiffOp =
+        fe::wedge::operators::shell::WedgeConstantDivKGrad< ScalarType >;
     using DiagSolverT  = linalg::solvers::DiagonalSolver< AD_EV >;
     using FGMRESDouble = linalg::solvers::FGMRES< AD_EV, DiagSolverT >;
     // Reduced-precision Krylov basis variant (operator stays double). FP16 storage
@@ -518,7 +520,7 @@ class EVSolver : public EnergySolver< ScalarType >
 
         if ( prm_.devel_parameters.extended_diagnostics )
             log_hbm( "EV: + nu_h_wedge (1 Grid5D per-wedge field; kappa is a scalar)" );
-        A_kappa_ = std::make_unique< EVDiffOp >( *domain_, coords_shell_, coords_radii_, diffusion_coeff_ );
+        A_kappa_ = std::make_unique< DiffOp >( *domain_, coords_shell_, coords_radii_, diffusion_coeff_ );
 
         // Global lumped mass M_lumped = M · 1, used to invert the global
         // Galerkin K·T into a Q1-nodal lap field per timestep:
@@ -1076,7 +1078,8 @@ class EVSolver : public EnergySolver< ScalarType >
     std::unique_ptr< AdiabaticOp >    AdiabaticHeating_;
     std::unique_ptr< ShearHeatingOp > ShearHeating_;
 
-    std::unique_ptr< EVDiffOp >     A_evdiff_, A_kappa_;
+    std::unique_ptr< EVDiffOp >     A_evdiff_;
+    std::unique_ptr< DiffOp >       A_kappa_;
     bool                            use_float_basis_ = false;
     std::unique_ptr< FGMRESDouble > solver_double_;
     std::unique_ptr< FGMRESFloat >  solver_float_;

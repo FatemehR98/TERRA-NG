@@ -250,7 +250,7 @@ Result<> run( const Parameters& prm )
 
     Kokkos::parallel_for(
         "compute diffusion_profile",
-        grid::shell::local_domain_md_range_policy_radial( domain ),
+        grid::shell::local_domain_md_range_policy_radial( *domains[velocity_level] ),
         KOKKOS_LAMBDA( int id, int r ) {
             diffusion_coeff_profile( id, r ) = kappa_profile( id, r ) / ( rho_profile( id, r ) * cp_profile( id, r ) );
         } );

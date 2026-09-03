@@ -443,33 +443,31 @@ Result<> run( const Parameters& prm )
                                                    ( prm.boundary_parameters.plate_parameters.plate_velocity_scaling );
 
     std::shared_ptr< plates::PlateVelocityProvider > oracle;
-    std::optional< Grid3DDataVec< ScalarType, 3 > >  plate_velocities;
+    std::optional< VectorQ1IsoQ2Q1< ScalarType > >   plate_velocities;
 
     if ( prm.boundary_parameters.plate_parameters.apply_plate_velocities )
     {
         // Initialise plate velocity grid
         plate_velocities.emplace(
             "plate_velocities",
-            coords_shell[velocity_level].extent( 0 ),
-            coords_shell[velocity_level].extent( 1 ),
-            coords_shell[velocity_level].extent( 2 ) );
+            *domains[velocity_level],
+            *domains[pressure_level],
+            ownership_mask_data[velocity_level],
+            ownership_mask_data[pressure_level] );
 
         oracle = initialise_plates(
             prm.boundary_parameters.plate_parameters.plates_topologies_path,
             prm.boundary_parameters.plate_parameters.plates_reconstructions_path );
 
-        // Extract plate velocities at initial_plate_age and write to velocity field for initial stokes solve.
+        // Extract plate velocities at initial_plate_age and pass to stokes solve for dirichlet boundary enforcement.
         extract_plate_velocities(
             plate_age_Ma,
-            *plate_velocities,
+            plate_velocities->block_1().grid_data(),
             *oracle,
             coords_shell[velocity_level],
             coords_radii[velocity_level],
             prm.boundary_parameters.plate_parameters.interpolate_plates_in_time,
             plate_velocity_nondim_scale );
-
-        apply_plate_velocities(
-            *plate_velocities, u.block_1().grid_data(), coords_radii[velocity_level].extent( 1 ) - 1 );
     }
 
     // ----- Initial Stokes solve -----
@@ -482,9 +480,20 @@ Result<> run( const Parameters& prm )
     // whereas rho_profile (Grid2DDataScalar) is already a plain Kokkos::View.
     if ( pda_form )
         stokes.solve(
-            Tdev, density->grid_data(), alpha_profile, prm.physics_parameters.compressible, /*log_convergence=*/true );
+            Tdev,
+            plate_velocities,
+            density->grid_data(),
+            alpha_profile,
+            prm.physics_parameters.compressible,
+            /*log_convergence=*/true );
     else
-        stokes.solve( Tdev, rho_profile, alpha_profile, prm.physics_parameters.compressible, /*log_convergence=*/true );
+        stokes.solve(
+            Tdev,
+            plate_velocities,
+            rho_profile,
+            alpha_profile,
+            prm.physics_parameters.compressible,
+            /*log_convergence=*/true );
 
     if ( prm.devel_parameters.extended_diagnostics )
         log_hbm( "after first Stokes solve (peak)" );
@@ -738,7 +747,7 @@ Result<> run( const Parameters& prm )
             {
                 extract_plate_velocities(
                     plate_age_Ma,
-                    *plate_velocities,
+                    plate_velocities->block_1().grid_data(),
                     *oracle,
                     coords_shell[velocity_level],
                     coords_radii[velocity_level],
@@ -775,13 +784,6 @@ Result<> run( const Parameters& prm )
                 stokes.update_viscosity( T );
             }
 
-            // Re-apply plate velocities every picard iteration
-            if ( prm.boundary_parameters.plate_parameters.apply_plate_velocities )
-            {
-                apply_plate_velocities(
-                    *plate_velocities, u.block_1().grid_data(), coords_radii[velocity_level].extent( 1 ) - 1 );
-            }
-
             // --- Stokes solve ---
             // Using full density for PDA, radial density profile else.
             // 3-D density for pda_form is passed unwrapped, see comment at
@@ -789,6 +791,7 @@ Result<> run( const Parameters& prm )
             if ( pda_form )
                 stokes.solve(
                     Tdev,
+                    plate_velocities,
                     density->grid_data(),
                     alpha_profile,
                     prm.physics_parameters.compressible,
@@ -796,6 +799,7 @@ Result<> run( const Parameters& prm )
             else
                 stokes.solve(
                     Tdev,
+                    plate_velocities,
                     rho_profile,
                     alpha_profile,
                     prm.physics_parameters.compressible,

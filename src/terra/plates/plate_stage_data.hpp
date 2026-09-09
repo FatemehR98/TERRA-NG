@@ -24,6 +24,7 @@
 /// swaps host() for device() at the call site and nothing else changes.
 
 #include <cmath>
+#include <stdexcept>
 #include <vector>
 
 #include "terra/dense/vec.hpp"
@@ -60,6 +61,14 @@ struct PlateStageViews
 
     /// Euler vector per plate, cartesian, degrees per Ma
     Kokkos::View< double* [3], Kokkos::LayoutRight, MemSpace > omega;
+
+    /// Whether \c omega is meaningful for a plate, size nPlates.
+    ///
+    /// Zero when the topologies name a plate that the rotation data does not describe. Such a plate has no
+    /// velocity at all, which is not the same as a velocity of zero, so consumers must skip it rather than
+    /// read its zero \c omega as "this plate does not move". The host query path expresses the same thing by
+    /// demoting a hit on such a plate to a miss.
+    Kokkos::View< unsigned char*, Kokkos::LayoutRight, MemSpace > hasRotation;
 
     /// Offsets into \c binPlate, size nLonBins * nLatBins + 1
     Kokkos::View< int*, Kokkos::LayoutRight, MemSpace > binBegin;
@@ -196,7 +205,21 @@ class PlateStageData
             host_.ringBegin( i ) = offset;
             host_.plateId( i )   = plates[i].id;
 
-            const vec3D w = computeEulerVector( rotations, static_cast< int >( plates[i].id ), age );
+            // A topology file may name plates the rotation file does not describe. Such a plate has no Euler
+            // vector; pack a zero and record the id, so that the caller can route points on it through its
+            // PlateNotFoundHandler instead of reading the zero as a genuine "this plate does not move".
+            vec3D w{ 0, 0, 0 };
+            host_.hasRotation( i ) = 1;
+            try
+            {
+                w = computeEulerVector( rotations, static_cast< int >( plates[i].id ), age );
+            }
+            catch ( const std::runtime_error& )
+            {
+                platesWithoutRotations_.push_back( plates[i].id );
+                host_.hasRotation( i ) = 0;
+            }
+
             for ( int d = 0; d < 3; ++d )
             {
                 host_.omega( i, d ) = w( d );
@@ -222,10 +245,17 @@ class PlateStageData
 
     double age() const { return age_; }
 
+    /// Plates in this stage whose reconstruction circuit could not be built from the rotation data. Their
+    /// packed Euler vector is zero and must not be used.
+    const std::vector< uint_t >& platesWithoutRotations() const { return platesWithoutRotations_; }
+
     const PlateStageViews< HostSpace >&   host() const { return host_; }
     const PlateStageViews< DeviceSpace >& device() const { return device_; }
 
   private:
+    std::vector< uint_t > platesWithoutRotations_;
+
+
     template < class Space >
     static void allocate( PlateStageViews< Space >& v, int nPlates, int nVerts, int nLonBins, int nLatBins )
     {
@@ -234,6 +264,8 @@ class PlateStageData
         v.plateId   = Kokkos::View< unsigned int*, Kokkos::LayoutRight, Space >( "plate_id", nPlates );
         v.cap       = Kokkos::View< double* [4], Kokkos::LayoutRight, Space >( "plate_cap", nPlates );
         v.omega     = Kokkos::View< double* [3], Kokkos::LayoutRight, Space >( "plate_omega", nPlates );
+        v.hasRotation =
+            Kokkos::View< unsigned char*, Kokkos::LayoutRight, Space >( "plate_has_rotation", nPlates );
         v.nPlates   = nPlates;
         v.nLonBins  = nLonBins;
         v.nLatBins  = nLatBins;
@@ -373,7 +405,8 @@ class PlateStageData
         device_.ringBegin = Kokkos::create_mirror_view_and_copy( DeviceSpace{}, host_.ringBegin );
         device_.plateId   = Kokkos::create_mirror_view_and_copy( DeviceSpace{}, host_.plateId );
         device_.cap       = Kokkos::create_mirror_view_and_copy( DeviceSpace{}, host_.cap );
-        device_.omega     = Kokkos::create_mirror_view_and_copy( DeviceSpace{}, host_.omega );
+        device_.omega       = Kokkos::create_mirror_view_and_copy( DeviceSpace{}, host_.omega );
+        device_.hasRotation = Kokkos::create_mirror_view_and_copy( DeviceSpace{}, host_.hasRotation );
 
         if ( host_.binBegin.extent( 0 ) > 0 )
         {

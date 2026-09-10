@@ -212,7 +212,7 @@ struct Parameters
     int         beginAge  = 10;
     int         endAge    = 0;
     std::string outdir    = "./output";
-    std::string dataDir   = "../../../TERRA-NG/data/plates/Chen2025-tomopac/";
+    std::string dataDir   = "./";
 };
 
 // ========

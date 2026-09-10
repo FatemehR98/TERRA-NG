@@ -43,13 +43,12 @@
 /// point is to exercise the new boundary condition, not to re-test the existing solver.
 
 #include <cmath>
+#include <cstdio>
 #include <iomanip>
 #include <sstream>
 #include <string>
 #include <optional>
 #include <vector>
-
-#include "device_plate_lookup.hpp"
 
 #include "fe/strong_algebraic_dirichlet_enforcement.hpp"
 #include "fe/wedge/operators/shell/epsilon_divdiv_stokes.hpp"
@@ -187,18 +186,63 @@ int main( int argc, char** argv )
     {
         util::Timer timer( "device_plate_id_lookup" );
 
-        const auto& plates_for_stage = oracle->plateTopologies().getPlatesForStage( static_cast< int >( prm.age ) );
-        const auto [coords_device, data_device, n_plates] =
-            plates::build_device_plate_containers( plates_for_stage );
+        // The stage must be prepared before its packed views (and Euler vectors) exist.
+        oracle->prepareEulerVectors( prm.age );
 
-        logroot << "  " << n_plates << " plates at stage " << static_cast< int >( prm.age ) << " Ma" << std::endl;
+        const auto& stage = oracle->stageFor( prm.age );
 
-        Kokkos::parallel_for(
-            "plate_id_lookup",
-            grid::shell::local_domain_md_range_policy_nodes( domain_fine ),
-            plates::PlateIDInterpolator(
-                prm.r_max, coords_fine, radii_grid, plate_id, n_plates, coords_device, data_device ) );
-        Kokkos::fence();
+        logroot << "  " << stage.device().nPlates << " plates at stage " << static_cast< int >( prm.age )
+                << " Ma" << std::endl;
+
+        plates::extract_plate_ids_device< ScalarType >(
+            domain_fine, coords_fine, radii_grid, stage.device(), plate_id );
+    }
+
+    // ==========================================================================================================
+    //  3b. The same plate ids on the host
+    // ==========================================================================================================
+    // One lookup per surface node, the same shape as the device pass above and as the Boost reference build,
+    // so that the three plate-id timings compare like for like.
+    logroot << "\n=== 3b. Plate id lookup (host) ===" << std::endl;
+
+    Grid4DDataScalar< ScalarType > plate_id_host( "plate_id_host", num_sub, n_lat, n_lat, n_rad );
+
+    {
+        auto coords_h = Kokkos::create_mirror_view( coords_fine );
+        Kokkos::deep_copy( coords_h, coords_fine );
+        auto radii_h = Kokkos::create_mirror_view( radii_grid );
+        Kokkos::deep_copy( radii_h, radii_grid );
+        auto pid_h = Kokkos::create_mirror_view( plate_id_host );
+        Kokkos::deep_copy( pid_h, ScalarType( 0 ) );
+
+        {
+            util::Timer timer( "host_plate_id_lookup" );
+
+            for ( int sd = 0; sd < num_sub; ++sd )
+                for ( int x = 0; x < n_lat; ++x )
+                    for ( int y = 0; y < n_lat; ++y )
+                    {
+                        const auto c = grid::shell::coords( sd, x, y, n_rad - 1, coords_h, radii_h );
+                        pid_h( sd, x, y, n_rad - 1 ) = static_cast< ScalarType >( oracle->findPlateID(
+                            dense::Vec< double, 3 >{ c( 0 ), c( 1 ), c( 2 ) }, prm.age ) );
+                    }
+        }
+
+        Kokkos::deep_copy( plate_id_host, pid_h );
+
+        auto pid_dev_h = Kokkos::create_mirror_view( plate_id );
+        Kokkos::deep_copy( pid_dev_h, plate_id );
+
+        long long id_mismatches = 0;
+        for ( int sd = 0; sd < num_sub; ++sd )
+            for ( int x = 0; x < n_lat; ++x )
+                for ( int y = 0; y < n_lat; ++y )
+                    if ( pid_h( sd, x, y, n_rad - 1 ) != pid_dev_h( sd, x, y, n_rad - 1 ) )
+                        ++id_mismatches;
+
+        logroot << "  host vs device plate ids: " << id_mismatches << " of "
+                << ( static_cast< long long >( num_sub ) * n_lat * n_lat ) << " surface nodes differ"
+                << std::endl;
     }
 
     // ==========================================================================================================
@@ -498,6 +542,25 @@ int main( int argc, char** argv )
     xdmf.write( 0 );
 
     logroot << "  wrote " << prm.outdir << std::endl;
+
+    // Surface velocities from the device path, on the mesh nodes, so the field can be differenced against
+    // another implementation evaluated at exactly the same points.
+    {
+        auto v_h = create_mirror( Kokkos::HostSpace{}, plate_velocities_device.block_1().grid_data() );
+        deep_copy( v_h, plate_velocities_device.block_1().grid_data() );
+
+        const std::string csv = prm.outdir + "_surface.csv";
+        std::FILE*        out = std::fopen( csv.c_str(), "w" );
+        std::fprintf( out, "sd,x,y,vx,vy,vz\n" );
+        for ( int sd = 0; sd < num_sub; ++sd )
+            for ( int x = 0; x < n_lat; ++x )
+                for ( int y = 0; y < n_lat; ++y )
+                    std::fprintf( out, "%d,%d,%d,%.17e,%.17e,%.17e\n", sd, x, y,
+                                  v_h( sd, x, y, n_rad - 1, 0 ), v_h( sd, x, y, n_rad - 1, 1 ),
+                                  v_h( sd, x, y, n_rad - 1, 2 ) );
+        std::fclose( out );
+        logroot << "  wrote " << csv << std::endl;
+    }
 
     timer_phase.reset();
     timer_total.reset();

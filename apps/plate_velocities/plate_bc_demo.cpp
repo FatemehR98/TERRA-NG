@@ -88,8 +88,8 @@ struct Parameters
     double      age        = 0.0;
     bool        interpolate_in_time = false;
     double      velocity_scale      = 1.0;
-    std::string topologies = "/p/scratch/training2644/terra-ng/data/topologies0-100Ma.geojson";
-    std::string reconstructions = "/p/scratch/training2644/terra-ng/data/Global_EarthByte_230-0Ma_GK07_AREPS.rot";
+    std::string topologies = "./topologies0-100Ma.geojson";
+    std::string reconstructions = "./Global_EarthByte_230-0Ma_GK07_AREPS.rot";
     std::string outdir     = "./plate_bc_demo_out";
 };
 

@@ -3,15 +3,11 @@
 #include <string>
 #include <vector>
 
-#include "communication/shell/fv_communication.hpp"
-#include "fv/hex/conversion.hpp"
-#include "fv/hex/helpers.hpp"
 #include "grid/grid_types.hpp"
 #include "grid/shell/spherical_shell.hpp"
 #include "interpolators.hpp"
 #include "io.hpp"
 #include "kokkos/kokkos_wrapper.hpp"
-#include "linalg/vector_fv.hpp"
 #include "linalg/vector_q1.hpp"
 #include "parameters.hpp"
 #include "shell/spherical_harmonics.hpp"
@@ -56,30 +52,22 @@ struct ComputePowerLawProfile
     }
 };
 
-/// Set T (Q1) and T_fct (FV) from the configured initial-condition profile,
-/// apply Dirichlet BCs on T_fct, exchange ghost layers, and L2-project to keep
-/// both fields consistent.
+/// Set T (Q1) from the configured initial-condition profile,
+/// and add an optional noise or spherical-harmonic perturbation of maximum size
+/// parameters.physics_parameters.initial_temperature.perturbation_amplitude.
 ///
-/// Two profiles are supported:
-///   * CONDUCTIVE: spherical steady-state conduction solution + optional
-///     spherical-harmonic perturbation (Y_l^m + factor·Y_l2^m2).  Q1 first,
-///     then projected to FV.
-///   * power-law + noise: FV interpolation followed by a per-cell noise add.
-///     FV first, then projected back to Q1.
-///
-/// In either case the post-condition is: T_fct holds the FV cell-averaged
-/// initial state with Dirichlet BCs applied and ghost layers populated; T is
-/// the L2-projected Q1 representation of T_fct.
+/// Three profiles are supported:
+///   * CONDUCTIVE: Spherical steady-state conduction solution.
+///   * POWER_LAW: Radial exponential T_min + (T_max - T_min) * radius_frac^5,
+///     with radius_frac = (r_max - radius) / (r_max - r_min).
+///   * FROM_FILE: Reading custom temperature profile from csv file.
 template < typename ScalarType >
 void initialize_temperature_fields(
     linalg::VectorQ1Scalar< ScalarType >&                           T,
-    linalg::VectorFVScalar< ScalarType >&                           T_fct,
     grid::Grid2DDataScalar< ScalarType >&                           T_ref,
-    const fv::hex::DirichletBCs< ScalarType >&                      fct_bcs,
     const grid::shell::DistributedDomain&                           domain,
     const grid::Grid3DDataVec< ScalarType, 3 >&                     coords_shell,
     const grid::Grid2DDataScalar< ScalarType >&                     coords_radii,
-    const linalg::VectorFVVec< ScalarType, 3 >&                     fv_cell_centers,
     const grid::Grid4DDataScalar< grid::NodeOwnershipFlag >&        ownership_mask,
     const grid::Grid4DDataScalar< grid::shell::ShellBoundaryFlag >& boundary_mask,
     const Parameters&                                               prm )
@@ -87,79 +75,155 @@ void initialize_temperature_fields(
     using util::logroot;
     const auto& init_temp = prm.physics_parameters.initial_temperature;
 
-    if ( prm.energy_solver_parameters.energy_solver != EnergySolverType::FCT )
+    if ( init_temp.profile == InitialTemperatureProfile::FROM_FILE )
     {
-        if ( init_temp.profile == InitialTemperatureProfile::FROM_FILE )
-        {
-            util::logroot << "Reading reference temperature from: '" << init_temp.Tref_profile_csv_path << "'"
-                          << std::endl;
+        util::logroot << "Reading reference temperature from: '" << init_temp.Tref_profile_csv_path << "'" << std::endl;
 
-            // Read and populate reference temperature profile
-            T_ref = shell::interpolate_radial_profile_into_subdomains_from_csv(
-                init_temp.Tref_profile_csv_path,
-                prm.physics_parameters.radial_profiles_radii_key,
-                init_temp.Tref_profile_value_key,
-                coords_radii,
-                ScalarType( 1 ) / prm.mesh_parameters.mantle_thickness_m,
-                ScalarType( 1 ) / prm.boundary_parameters.delta_T_K );
-        }
+        // Read and populate reference temperature profile
+        T_ref = shell::interpolate_radial_profile_into_subdomains_from_csv(
+            init_temp.Tref_profile_csv_path,
+            prm.physics_parameters.radial_profiles_radii_key,
+            init_temp.Tref_profile_value_key,
+            coords_radii,
+            ScalarType( 1 ) / prm.mesh_parameters.mantle_thickness_m,
+            ScalarType( 1 ) / prm.boundary_parameters.delta_T_K );
+    }
 
-        else if ( init_temp.profile == InitialTemperatureProfile::CONDUCTIVE )
-        {
-            util::logroot << "Computing conductive reference temperature profile" << std::endl;
+    else if ( init_temp.profile == InitialTemperatureProfile::CONDUCTIVE )
+    {
+        util::logroot << "Computing conductive reference temperature profile" << std::endl;
 
-            Kokkos::parallel_for(
-                "ComputeConductiveProfile",
-                grid::shell::local_domain_md_range_policy_radial( domain ),
-                ComputeConductiveProfile{
-                    prm.mesh_parameters.radius_min,
-                    prm.mesh_parameters.radius_max,
-                    prm.boundary_parameters.temperature_min,
-                    coords_radii,
-                    T_ref } );
-        }
-
-        else if ( init_temp.profile == InitialTemperatureProfile::POWER_LAW )
-        {
-            util::logroot << "Computing power-law reference temperature profile" << std::endl;
-
-            Kokkos::parallel_for(
-                "ComputePowerLawProfile",
-                grid::shell::local_domain_md_range_policy_radial( domain ),
-                ComputePowerLawProfile{
-                    prm.mesh_parameters.radius_min,
-                    prm.mesh_parameters.radius_max,
-                    prm.boundary_parameters.temperature_min,
-                    prm.boundary_parameters.temperature_max,
-                    coords_radii,
-                    T_ref } );
-        }
-
-        // Broadcast reference profile to Q1 nodes
         Kokkos::parallel_for(
-            "RadialProfileToQ1",
+            "ComputeConductiveProfile",
+            grid::shell::local_domain_md_range_policy_radial( domain ),
+            ComputeConductiveProfile{
+                prm.mesh_parameters.radius_min,
+                prm.mesh_parameters.radius_max,
+                prm.boundary_parameters.temperature_min,
+                coords_radii,
+                T_ref } );
+    }
+
+    else if ( init_temp.profile == InitialTemperatureProfile::POWER_LAW )
+    {
+        util::logroot << "Computing power-law reference temperature profile" << std::endl;
+
+        Kokkos::parallel_for(
+            "ComputePowerLawProfile",
+            grid::shell::local_domain_md_range_policy_radial( domain ),
+            ComputePowerLawProfile{
+                prm.mesh_parameters.radius_min,
+                prm.mesh_parameters.radius_max,
+                prm.boundary_parameters.temperature_min,
+                prm.boundary_parameters.temperature_max,
+                coords_radii,
+                T_ref } );
+    }
+
+    // Broadcast reference profile to Q1 nodes
+    Kokkos::parallel_for(
+        "RadialProfileToQ1",
+        grid::shell::local_domain_md_range_policy_nodes( domain ),
+        RadialProfileToQ1{ T.grid_data(), T_ref } );
+    Kokkos::fence();
+
+    // Add initial perturbation
+    if ( init_temp.perturbation == InitialPerturbation::NOISE )
+    {
+        util::logroot << "Adding random noise..." << std::endl;
+
+        // Add noise
+        Kokkos::parallel_for(
+            "noise to Q1 temperature",
             grid::shell::local_domain_md_range_policy_nodes( domain ),
-            RadialProfileToQ1{ T.grid_data(), T_ref } );
+            NoiseAdder{
+                init_temp.perturbation_amplitude,
+                prm.boundary_parameters.temperature_min,
+                prm.boundary_parameters.temperature_max,
+                prm.mesh_parameters.radius_min,
+                prm.mesh_parameters.radius_max,
+                true, /* taper_near_boundaries */
+                coords_shell,
+                coords_radii,
+                T.grid_data(),
+                ownership_mask } );
         Kokkos::fence();
 
-        // Add initial perturbation
-        if ( init_temp.perturbation == InitialPerturbation::NOISE )
-        {
-            util::logroot << "Adding random noise..." << std::endl;
+        // Communicate to ghost nodes
+        communication::shell::send_recv( domain, T.grid_data(), communication::CommunicationReduction::MAX );
+    }
 
-            // Add noise
+    else if ( init_temp.perturbation == InitialPerturbation::SPHERICAL_HARMONICS )
+    {
+        const bool sph = ( init_temp.sph_degree_l > 0 && init_temp.perturbation_amplitude != 0.0 );
+        const bool sph_2 =
+            ( init_temp.sph_degree_l_2 > 0 && init_temp.sph_factor_2 != 0.0 &&
+              init_temp.perturbation_amplitude != 0.0 );
+
+        if ( sph )
+        {
+            util::logroot << "Adding spherical harmonic perturbation..." << std::endl;
+
+            grid::Grid3DDataScalar< ScalarType > sph_coeffs;
+
+            sph_coeffs = shell::spherical_harmonics_coefficients_grid< ScalarType, ScalarType >(
+                init_temp.sph_degree_l, init_temp.sph_order_m, coords_shell );
+
+            if ( sph_2 )
+            {
+                grid::Grid3DDataScalar< ScalarType > sph_coeffs_2;
+
+                sph_coeffs_2 = shell::spherical_harmonics_coefficients_grid< ScalarType, ScalarType >(
+                    init_temp.sph_degree_l_2, init_temp.sph_order_m_2, coords_shell );
+                const ScalarType factor_2 = static_cast< ScalarType >( init_temp.sph_factor_2 );
+
+                // Combine spherical harmonics
+                Kokkos::parallel_for(
+                    "combine spherical harmonics",
+                    Kokkos::MDRangePolicy< Kokkos::Rank< 3 > >(
+                        { 0, 0, 0 },
+                        { static_cast< int >( sph_coeffs.extent( 0 ) ),
+                          static_cast< int >( sph_coeffs.extent( 1 ) ),
+                          static_cast< int >( sph_coeffs.extent( 2 ) ) } ),
+                    KOKKOS_LAMBDA( int sd, int x, int y ) {
+                        sph_coeffs( sd, x, y ) += factor_2 * sph_coeffs_2( sd, x, y );
+                    } );
+                Kokkos::fence();
+            }
+
+            // Normalize sph-coefficients to [-1, 1], so the user-chosen perturbation amplitude remains meaningful
+            ScalarType max_abs_sph;
+
+            Kokkos::parallel_reduce(
+                "sph_coeffs_max_abs",
+                Kokkos::MDRangePolicy< Kokkos::Rank< 3 > >(
+                    { 0, 0, 0 }, { sph_coeffs.extent( 0 ), sph_coeffs.extent( 1 ), sph_coeffs.extent( 2 ) } ),
+                KOKKOS_LAMBDA( int id, int x, int y, ScalarType& max_tmp ) {
+                    max_tmp = Kokkos::max( max_tmp, Kokkos::abs( sph_coeffs( id, x, y ) ) );
+                },
+                Kokkos::Max< ScalarType >( max_abs_sph ) );
+
+            // Normalize in-place
             Kokkos::parallel_for(
-                "noise to Q1 temperature",
+                "normalize sph_coeffs",
+                Kokkos::MDRangePolicy< Kokkos::Rank< 3 > >(
+                    { 0, 0, 0 }, { sph_coeffs.extent( 0 ), sph_coeffs.extent( 1 ), sph_coeffs.extent( 2 ) } ),
+                KOKKOS_LAMBDA( int id, int x, int y ) { sph_coeffs( id, x, y ) /= max_abs_sph; } );
+            Kokkos::fence();
+
+            // Add spherical harmonic perturbation
+            Kokkos::parallel_for(
+                "SphericalHarmonicPerturbationAdder",
                 grid::shell::local_domain_md_range_policy_nodes( domain ),
-                NoiseAdder{
+                SphericalHarmonicPerturbationAdder{
                     init_temp.perturbation_amplitude,
                     prm.boundary_parameters.temperature_min,
                     prm.boundary_parameters.temperature_max,
                     prm.mesh_parameters.radius_min,
                     prm.mesh_parameters.radius_max,
-                    true, /* taper_near_boundaries */
-                    coords_shell,
+                    true, /*taper_near_boundaries*/
                     coords_radii,
+                    sph_coeffs,
                     T.grid_data(),
                     ownership_mask } );
             Kokkos::fence();
@@ -167,131 +231,6 @@ void initialize_temperature_fields(
             // Communicate to ghost nodes
             communication::shell::send_recv( domain, T.grid_data(), communication::CommunicationReduction::MAX );
         }
-
-        else if ( init_temp.perturbation == InitialPerturbation::SPHERICAL_HARMONICS )
-        {
-            const bool sph = ( init_temp.sph_degree_l > 0 && init_temp.perturbation_amplitude != 0.0 );
-            const bool sph_2 =
-                ( init_temp.sph_degree_l_2 > 0 && init_temp.sph_factor_2 != 0.0 &&
-                  init_temp.perturbation_amplitude != 0.0 );
-
-            if ( sph )
-            {
-                util::logroot << "Adding spherical harmonic perturbation..." << std::endl;
-
-                grid::Grid3DDataScalar< ScalarType > sph_coeffs;
-
-                sph_coeffs = shell::spherical_harmonics_coefficients_grid< ScalarType, ScalarType >(
-                    init_temp.sph_degree_l, init_temp.sph_order_m, coords_shell );
-
-                if ( sph_2 )
-                {
-                    grid::Grid3DDataScalar< ScalarType > sph_coeffs_2;
-
-                    sph_coeffs_2 = shell::spherical_harmonics_coefficients_grid< ScalarType, ScalarType >(
-                        init_temp.sph_degree_l_2, init_temp.sph_order_m_2, coords_shell );
-                    const ScalarType factor_2 = static_cast< ScalarType >( init_temp.sph_factor_2 );
-
-                    // Combine spherical harmonics
-                    Kokkos::parallel_for(
-                        "combine spherical harmonics",
-                        Kokkos::MDRangePolicy< Kokkos::Rank< 3 > >(
-                            { 0, 0, 0 },
-                            { static_cast< int >( sph_coeffs.extent( 0 ) ),
-                              static_cast< int >( sph_coeffs.extent( 1 ) ),
-                              static_cast< int >( sph_coeffs.extent( 2 ) ) } ),
-                        KOKKOS_LAMBDA( int sd, int x, int y ) {
-                            sph_coeffs( sd, x, y ) += factor_2 * sph_coeffs_2( sd, x, y );
-                        } );
-                    Kokkos::fence();
-                }
-
-                // Normalize sph-coefficients to [-1, 1], so the user-chosen perturbation amplitude remains meaningful
-                ScalarType max_abs_sph;
-
-                Kokkos::parallel_reduce(
-                    "sph_coeffs_max_abs",
-                    Kokkos::MDRangePolicy< Kokkos::Rank< 3 > >(
-                        { 0, 0, 0 }, { sph_coeffs.extent( 0 ), sph_coeffs.extent( 1 ), sph_coeffs.extent( 2 ) } ),
-                    KOKKOS_LAMBDA( int id, int x, int y, ScalarType& max_tmp ) {
-                        max_tmp = Kokkos::max( max_tmp, Kokkos::abs( sph_coeffs( id, x, y ) ) );
-                    },
-                    Kokkos::Max< ScalarType >( max_abs_sph ) );
-
-                // Normalize in-place
-                Kokkos::parallel_for(
-                    "normalize sph_coeffs",
-                    Kokkos::MDRangePolicy< Kokkos::Rank< 3 > >(
-                        { 0, 0, 0 }, { sph_coeffs.extent( 0 ), sph_coeffs.extent( 1 ), sph_coeffs.extent( 2 ) } ),
-                    KOKKOS_LAMBDA( int id, int x, int y ) { sph_coeffs( id, x, y ) /= max_abs_sph; } );
-                Kokkos::fence();
-
-                // Add spherical harmonic perturbation
-                Kokkos::parallel_for(
-                    "SphericalHarmonicPerturbationAdder",
-                    grid::shell::local_domain_md_range_policy_nodes( domain ),
-                    SphericalHarmonicPerturbationAdder{
-                        init_temp.perturbation_amplitude,
-                        prm.boundary_parameters.temperature_min,
-                        prm.boundary_parameters.temperature_max,
-                        prm.mesh_parameters.radius_min,
-                        prm.mesh_parameters.radius_max,
-                        true, /*taper_near_boundaries*/
-                        coords_radii,
-                        sph_coeffs,
-                        T.grid_data(),
-                        ownership_mask } );
-                Kokkos::fence();
-
-                // Communicate to ghost nodes
-                communication::shell::send_recv( domain, T.grid_data(), communication::CommunicationReduction::MAX );
-            }
-        }
-    }
-
-    // Project Q1 -> FV
-    //fv::hex::l2_project_fe_to_fv( T_fct, T, domain, coords_shell, coords_radii );
-
-    else // FCT
-    {
-        logroot << "Initial temperature with FCT: power-law + noise" << std::endl;
-
-        Kokkos::parallel_for(
-            "initial temp interpolation (FCT)",
-            grid::shell::local_domain_md_range_policy_cells_fv_skip_ghost_layers( domain ),
-            FVInitialConditionInterpolator{
-                domain.domain_info().radii().front(),
-                domain.domain_info().radii().back(),
-                prm.boundary_parameters.temperature_min,
-                prm.boundary_parameters.temperature_max,
-                fv_cell_centers.grid_data(),
-                T_fct.grid_data() } );
-        Kokkos::fence();
-
-        Kokkos::parallel_for(
-            "adding noise to temp (FCT)",
-            grid::shell::local_domain_md_range_policy_cells_fv_skip_ghost_layers( domain ),
-            FVNoiseAdder{
-                prm.boundary_parameters.temperature_min,
-                prm.boundary_parameters.temperature_max,
-                T_fct.grid_data(),
-                Kokkos::Random_XorShift64_Pool<>( 12345 ) } );
-        Kokkos::fence();
-
-        // Enforce Dirichlet BCs on the FV field and exchange ghost layers.
-        fv::hex::apply_dirichlet_bcs( T_fct, boundary_mask, fct_bcs, domain );
-        communication::shell::update_fv_ghost_layers( domain, T_fct.grid_data() );
-
-        // Project T_fct → Q1 T so downstream consumers (Stokes RHS, output, Nusselt
-        // diagnostic) see a consistent Q1 representation.  Allocate the L2 scratch
-        // locally — this is a one-shot setup call, not a hot loop.
-        std::vector< linalg::VectorQ1Scalar< ScalarType > > init_l2_tmps;
-        init_l2_tmps.reserve( 5 );
-        for ( int i = 0; i < 5; ++i )
-        {
-            init_l2_tmps.emplace_back( "init_l2_tmp_" + std::to_string( i ), domain, ownership_mask );
-        }
-        fv::hex::l2_project_fv_to_fe_lumped( T, T_fct, domain, coords_shell, coords_radii, init_l2_tmps );
     }
 }
 
@@ -419,12 +358,11 @@ void compute_reference_conductive_profile(
     // a SUM exchange would multiply it by the sharing count.
 }
 
-/// Load (u, T) from an XDMF checkpoint and rebuild T_fct via FE→FV projection.
+/// Load (u, T) from an XDMF checkpoint.
 template < typename ScalarType >
 void load_temperature_checkpoint(
     linalg::VectorQ1Vec< ScalarType, 3 >&       u_velocity,
     linalg::VectorQ1Scalar< ScalarType >&       T,
-    linalg::VectorFVScalar< ScalarType >&       T_fct,
     const grid::shell::DistributedDomain&       domain,
     const grid::Grid3DDataVec< ScalarType, 3 >& coords_shell,
     const grid::Grid2DDataScalar< ScalarType >& coords_radii,
@@ -494,11 +432,6 @@ void load_temperature_checkpoint(
         scale( T.grid_data(), ScalarType( 1 ) / prm.boundary_parameters.delta_T_K );
         scale( u_velocity.grid_data(), ScalarType( 1 ) / prm.physics_parameters.calc_cm_per_year );
     }
-
-    // T_fct is not stored in checkpoints (only Q1 T is).  Recover it via FE→FV
-    // projection.  Ghost layers are populated inside l2_project_fe_to_fv, so
-    // the result is immediately usable by FCT kernels.
-    fv::hex::l2_project_fe_to_fv( T_fct, T, domain, coords_shell, coords_radii );
 }
 
 } // namespace terra::mantlecirculation

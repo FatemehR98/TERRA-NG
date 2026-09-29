@@ -4,7 +4,6 @@
 #include "fe/wedge/integrands.hpp"
 #include "grid/grid_types.hpp"
 #include "kokkos/kokkos_wrapper.hpp"
-#include "linalg/vector_fv.hpp"
 #include "linalg/vector_q1isoq2_q1.hpp"
 
 namespace terra::mantlecirculation {

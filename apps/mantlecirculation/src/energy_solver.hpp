@@ -7,13 +7,12 @@
 #include <vector>
 
 #include "fe/strong_algebraic_dirichlet_enforcement.hpp"
+#include "fe/wedge/linearforms/shell/energy_source_terms.hpp"
 #include "fe/wedge/operators/shell/entropy_viscosity.hpp"
 #include "fe/wedge/operators/shell/mass.hpp"
 #include "fe/wedge/operators/shell/unsteady_advection_diffusion_supg.hpp"
 #include "fe/wedge/operators/shell/unsteady_advection_diffusion_supg_kerngen.hpp"
 #include "fe/wedge/operators/shell/wedge_constant_div_k_grad.hpp"
-#include "fv/hex/conversion.hpp"
-#include "fv/hex/operators/fct_advection_diffusion.hpp"
 #include "grid/grid_types.hpp"
 #include "grid/shell/spherical_shell.hpp"
 #include "hbm_probe.hpp"
@@ -22,7 +21,6 @@
 #include "linalg/solvers/diagonal_solver.hpp"
 #include "linalg/solvers/fgmres.hpp"
 #include "linalg/solvers/fgmres_lowmem.hpp"
-#include "linalg/vector_fv.hpp"
 #include "linalg/vector_q1.hpp"
 #include "parameters.hpp"
 #include "util/logging.hpp"
@@ -103,7 +101,7 @@ void log_timestep_info(
     const Parameters& prm,
     const int         timestep,
     ScalarType        max_velocity,
-    ScalarType        max_radial_h,
+    ScalarType        min_radial_h,
     ScalarType        dt_cfl,
     ScalarType        dt )
 {
@@ -115,7 +113,7 @@ void log_timestep_info(
 
     // Compute dimensional values if required
     max_velocity *= vel_scale;
-    max_radial_h *= grid_scale;
+    min_radial_h *= grid_scale;
     dt_cfl *= time_scale;
     dt *= time_scale;
 
@@ -129,8 +127,8 @@ void log_timestep_info(
                   << max_velocity << std::endl;
     util::logroot << "    h"
                   << ( log_dimensional ? " (m)   :                      " : " :                            " )
-                  << max_radial_h << std::endl;
-    util::logroot << "    cfl timestep size (= dt_scaling * h/v_max): " << dt_cfl << ( log_dimensional ? " Ma" : "" )
+                  << min_radial_h << std::endl;
+    util::logroot << "    cfl timestep size (= cfl_number * h/v_max): " << dt_cfl << ( log_dimensional ? " Ma" : "" )
                   << std::endl;
     if ( dt_cfl > dt_max )
     {
@@ -264,7 +262,7 @@ class SUPGSolver : public EnergySolver< ScalarType >
     {
         // SUPG: implicit diffusion, dt only constrained by advection CFL.
         const auto max_vel = kernels::common::max_vector_magnitude( velocity_.grid_data() );
-        const auto dt_cfl  = prm_.time_stepping_parameters.dt_scaling * h_ / max_vel;
+        const auto dt_cfl  = prm_.time_stepping_parameters.cfl_number * h_ / max_vel;
         const auto dt      = std::clamp(
             ramp_dt( dt_cfl, timestep, prm_.time_stepping_parameters.initial_dt_ramp_steps ),
             prm_.time_stepping_parameters.dt_min,
@@ -369,11 +367,16 @@ class SUPGSolver : public EnergySolver< ScalarType >
 /// Implicit Galerkin energy solve with explicit lagged entropy-viscosity
 /// stabilization (KHB / ASPECT recipe).  LHS is pure-Galerkin AD (SUPG OFF);
 /// stabilization is added to the RHS as `-dt · DivKGrad(ν_h) · T^n`.
-template < typename ScalarType >
+template < typename ScalarType, typename CoeffType >
 class EVSolver : public EnergySolver< ScalarType >
 {
-    using AD_EV        = fe::wedge::operators::shell::UnsteadyAdvectionDiffusionSUPGKerngen< ScalarType >;
-    using TempMass     = fe::wedge::operators::shell::Mass< ScalarType >;
+    using AD_EV = fe::wedge::operators::shell::
+        UnsteadyAdvectionDiffusionSUPGKerngen< ScalarType, typename CoeffType::DiffusionCoeffT >;
+    using TempMass = fe::wedge::operators::shell::Mass< ScalarType >;
+    using KMassType =
+        terra::fe::wedge::operators::shell::KMass< ScalarType, typename CoeffType::InternalHeatingCoeffT >;
+    using DiffOp =
+        fe::wedge::operators::shell::WedgeConstantDivKGrad< ScalarType, typename CoeffType::DiffusionCoeffT >;
     using EVDiffOp     = fe::wedge::operators::shell::WedgeConstantDivKGrad< ScalarType >;
     using DiagSolverT  = linalg::solvers::DiagonalSolver< AD_EV >;
     using FGMRESDouble = linalg::solvers::FGMRES< AD_EV, DiagSolverT >;
@@ -382,6 +385,11 @@ class EVSolver : public EnergySolver< ScalarType >
     using BasisVecT   = linalg::VectorQ1Scalar< Kokkos::Experimental::bhalf_t >;
     using FGMRESFloat = linalg::solvers::FGMRESLowMem< AD_EV, BasisVecT, DiagSolverT >;
 
+    using AdiabaticOp =
+        fe::wedge::linearforms::shell::AdiabaticHeatingTerm< ScalarType, typename CoeffType::AdiabaticHeatingCoeffT >;
+    using ShearHeatingOp =
+        fe::wedge::linearforms::shell::ShearHeatingTerm< ScalarType, typename CoeffType::ShearHeatingCoeffT >;
+
   public:
     EVSolver(
         const std::shared_ptr< grid::shell::DistributedDomain >&        domain,
@@ -389,8 +397,14 @@ class EVSolver : public EnergySolver< ScalarType >
         const grid::Grid2DDataScalar< ScalarType >&                     coords_radii,
         const grid::Grid4DDataScalar< grid::shell::ShellBoundaryFlag >& boundary_mask,
         const grid::Grid4DDataScalar< grid::NodeOwnershipFlag >&        ownership_mask,
+        const linalg::VectorQ1Scalar< ScalarType >&                     eta,
         const linalg::VectorQ1Vec< ScalarType, 3 >&                     velocity,
         linalg::VectorQ1Scalar< ScalarType >&                           T,
+        typename CoeffType::DiffusionCoeffT                             diffusion_coeff,
+        ScalarType                                                      surface_diffusion_coeff,
+        typename CoeffType::InternalHeatingCoeffT                       internal_heating_coeff,
+        typename CoeffType::AdiabaticHeatingCoeffT                      adiabatic_heating_coeff,
+        typename CoeffType::ShearHeatingCoeffT                          shear_heating_coeff,
         ScalarType                                                      h,
         const Parameters&                                               prm,
         std::shared_ptr< util::Table >                                  table )
@@ -399,8 +413,13 @@ class EVSolver : public EnergySolver< ScalarType >
     , coords_radii_( coords_radii )
     , boundary_mask_( boundary_mask )
     , ownership_mask_( ownership_mask )
+    , eta_( eta )
     , velocity_( velocity )
     , T_( T )
+    , diffusion_coeff_( diffusion_coeff )
+    , internal_heating_coeff_( internal_heating_coeff )
+    , adiabatic_heating_coeff_( adiabatic_heating_coeff )
+    , shear_heating_coeff_( shear_heating_coeff )
     , h_( h )
     , prm_( prm )
     , table_( std::move( table ) )
@@ -445,7 +464,8 @@ class EVSolver : public EnergySolver< ScalarType >
             coords_radii_,
             boundary_mask_,
             velocity_,
-            prm_.physics_parameters.thermal_diffusivity_nondim,
+            // surface_diffusion_coeff,
+            diffusion_coeff_,
             ScalarType( 0 ),
             /*treat_boundary=*/true );
         A_->set_supg_enabled( false );
@@ -456,7 +476,8 @@ class EVSolver : public EnergySolver< ScalarType >
             coords_radii_,
             boundary_mask_,
             velocity_,
-            prm_.physics_parameters.thermal_diffusivity_nondim,
+            // surface_diffusion_coeff,
+            diffusion_coeff_,
             ScalarType( 0 ),
             /*treat_boundary=*/false );
         A_neumann_->set_supg_enabled( false );
@@ -467,7 +488,8 @@ class EVSolver : public EnergySolver< ScalarType >
             coords_radii_,
             boundary_mask_,
             velocity_,
-            prm_.physics_parameters.thermal_diffusivity_nondim,
+            // surface_diffusion_coeff,
+            diffusion_coeff_,
             ScalarType( 0 ),
             /*treat_boundary=*/false,
             /*diagonal=*/true );
@@ -475,17 +497,23 @@ class EVSolver : public EnergySolver< ScalarType >
 
         M_ = std::make_unique< TempMass >( *domain_, coords_shell_, coords_radii_, false );
 
-        // Global Galerkin Laplacian for κ∇²T projection.  κ is spatially uniform
-        // (a single physics parameter), so we use the constant-coefficient
-        // overload of the ∇·(ν ∇·) operator — no per-wedge Grid5D κ field is
-        // stored — giving the standard ∫ κ ∇φ_i · ∇φ_j with additive halo exchange.
+        KMassInternalHeating_ =
+            std::make_unique< KMassType >( *domain_, coords_shell_, coords_radii_, internal_heating_coeff, false );
+
+        AdiabaticHeating_ = std::make_unique< AdiabaticOp >(
+            *domain_, coords_shell_, coords_radii_, T_, velocity_, adiabatic_heating_coeff );
+
+        ShearHeating_ = std::make_unique< ShearHeatingOp >(
+            *domain_, coords_shell_, coords_radii_, eta, velocity_, shear_heating_coeff );
+
+        // Global Galerkin Laplacian for the ∇·(κ∇T) projection.  κ = kappa/(ρ c_p)
+        // is evaluated per quadrature point by the diffusion coefficient functor,
+        // so no per-wedge Grid5D κ field is stored — giving ∫ κ ∇φ_i · ∇φ_j with
+        // additive halo exchange.
+
         if ( prm_.devel_parameters.extended_diagnostics )
-            log_hbm( "EV: + nu_h_wedge (1 Grid5D per-wedge field; kappa is a scalar)" );
-        A_kappa_ = std::make_unique< EVDiffOp >(
-            *domain_,
-            coords_shell_,
-            coords_radii_,
-            static_cast< ScalarType >( prm_.physics_parameters.thermal_diffusivity_nondim ) );
+            log_hbm( "EV: + nu_h_wedge (1 Grid5D per-wedge field; kappa comes from a coefficient functor)" );
+        A_kappa_ = std::make_unique< DiffOp >( *domain_, coords_shell_, coords_radii_, diffusion_coeff_ );
 
         // Global lumped mass M_lumped = M · 1, used to invert the global
         // Galerkin K·T into a Q1-nodal lap field per timestep:
@@ -557,7 +585,7 @@ class EVSolver : public EnergySolver< ScalarType >
     ScalarType compute_dt( const int timestep ) override
     {
         const auto max_vel = kernels::common::max_vector_magnitude( velocity_.grid_data() );
-        const auto dt_cfl  = prm_.time_stepping_parameters.dt_scaling * h_ / max_vel;
+        const auto dt_cfl  = prm_.time_stepping_parameters.cfl_number * h_ / max_vel;
         const auto dt      = std::clamp(
             ramp_dt( dt_cfl, timestep, prm_.time_stepping_parameters.initial_dt_ramp_steps ),
             prm_.time_stepping_parameters.dt_min,
@@ -874,11 +902,6 @@ class EVSolver : public EnergySolver< ScalarType >
             linalg::invert_entries( diag_ );
         }
 
-        const ScalarType gamma =
-            prm_.physics_parameters.internal_heating ?
-                static_cast< ScalarType >( prm_.physics_parameters.h_number / prm_.physics_parameters.cp_profile ) :
-                ScalarType( 0 );
-
         for ( int i = 0; i < prm_.energy_solver_parameters.energy_substeps; ++i )
         {
             util::logroot << "Solving energy (EV, substep " << i << ") ..." << std::endl;
@@ -927,10 +950,11 @@ class EVSolver : public EnergySolver< ScalarType >
                 // 2) Entropy stats (volume-weighted E_avg) and per-wedge ν_h.
                 const auto stats = fe::wedge::operators::shell::compute_entropy_stats(
                     T_, ownership_mask_, *domain_, coords_shell_, coords_radii_, ev_params_ );
-                fe::wedge::operators::shell::compute_nu_h(
+                fe::wedge::operators::shell::compute_nu_h< double, CoeffType >(
                     nu_h_wedge_,
                     T_,
                     T_prev_,
+                    eta_,
                     velocity_,
                     lap_T_.grid_data(),
                     *domain_,
@@ -939,7 +963,9 @@ class EVSolver : public EnergySolver< ScalarType >
                     dt,
                     stats,
                     ev_params_,
-                    gamma );
+                    internal_heating_coeff_,
+                    adiabatic_heating_coeff_,
+                    shear_heating_coeff_ );
             }
             if ( i == 0 )
             {
@@ -953,14 +979,27 @@ class EVSolver : public EnergySolver< ScalarType >
             linalg::apply( *M_, T_, q_ );
             linalg::lincomb( q_, { ScalarType( 1 ), -dt }, { q_, rhs_ev_ } );
 
-            // 4b) Constant internal-heating source: q += dt · M · γ.
-            //     rhs_ev_ is finished with at this point and is reused as a
-            //     scratch γ-vector; tmp_ is also free until the Dirichlet
-            //     enforcement below.
-            if ( gamma != ScalarType( 0 ) )
+            // 4b) Internal-heating source: q += dt · K_h · 1, where K_h is the
+            //     coefficient-weighted mass operator ∫ (H̃/c_p) φ_i φ_j.  rhs_ev_
+            //     is finished with at this point and is reused as a scratch
+            //     vector of ones; tmp_ is also free until the Dirichlet
+            //     enforcement below.  The coefficient functor returns 0 when
+            //     internal heating is disabled, so no guard is needed here.
             {
-                linalg::assign( rhs_ev_, gamma );
-                linalg::apply( *M_, rhs_ev_, tmp_ );
+                kernels::common::set_constant( rhs_ev_.grid_data(), 1.0 );
+                linalg::apply( *KMassInternalHeating_, rhs_ev_, tmp_ );
+                linalg::lincomb( q_, { ScalarType( 1 ), dt }, { q_, tmp_ } );
+            }
+
+            // 4c) Adiabatic heating: q += dt · ∫ -Di·α/c_p (u·r̂) T φ_i.
+            {
+                linalg::apply( *AdiabaticHeating_, tmp_ );
+                linalg::lincomb( q_, { ScalarType( 1 ), dt }, { q_, tmp_ } );
+            }
+
+            // 4d) Shear heating: q += dt · ∫ Di·Pe/Ra · 1/(ρ c_p) · 2η ε':ε' φ_i.
+            {
+                linalg::apply( *ShearHeating_, tmp_ );
                 linalg::lincomb( q_, { ScalarType( 1 ), dt }, { q_, tmp_ } );
             }
 
@@ -1013,13 +1052,20 @@ class EVSolver : public EnergySolver< ScalarType >
     const grid::Grid4DDataScalar< grid::NodeOwnershipFlag >&        ownership_mask_;
     const linalg::VectorQ1Vec< ScalarType, 3 >&                     velocity_;
     linalg::VectorQ1Scalar< ScalarType >&                           T_;
+    const linalg::VectorQ1Scalar< ScalarType >&                     eta_;
     ScalarType                                                      h_;
     const Parameters&                                               prm_;
     std::shared_ptr< util::Table >                                  table_;
 
-    std::unique_ptr< AD_EV >        A_, A_neumann_, A_neumann_diag_;
-    std::unique_ptr< TempMass >     M_;
-    std::unique_ptr< EVDiffOp >     A_evdiff_, A_kappa_;
+    std::unique_ptr< AD_EV >    A_, A_neumann_, A_neumann_diag_;
+    std::unique_ptr< TempMass > M_;
+
+    std::unique_ptr< KMassType >      KMassInternalHeating_;
+    std::unique_ptr< AdiabaticOp >    AdiabaticHeating_;
+    std::unique_ptr< ShearHeatingOp > ShearHeating_;
+
+    std::unique_ptr< EVDiffOp >     A_evdiff_;
+    std::unique_ptr< DiffOp >       A_kappa_;
     bool                            use_float_basis_ = false;
     std::unique_ptr< FGMRESDouble > solver_double_;
     std::unique_ptr< FGMRESFloat >  solver_float_;
@@ -1052,172 +1098,11 @@ class EVSolver : public EnergySolver< ScalarType >
     // snapshot_for_picard), set to true once substep-0 has computed ν_h so
     // subsequent Picard iterations of the same step skip the recompute.
     bool nu_h_locked_for_step_ = false;
+
+    typename CoeffType::DiffusionCoeffT diffusion_coeff_;
+
+    typename CoeffType::InternalHeatingCoeffT  internal_heating_coeff_;
+    typename CoeffType::AdiabaticHeatingCoeffT adiabatic_heating_coeff_;
+    typename CoeffType::ShearHeatingCoeffT     shear_heating_coeff_;
 };
-
-/// Explicit FCT energy update on the FV mesh, with L2 projection onto Q1 at
-/// the end of each timestep so downstream consumers (Stokes buoyancy, Nu) see
-/// the updated Q1 temperature.
-template < typename ScalarType >
-class FCTSolver : public EnergySolver< ScalarType >
-{
-  public:
-    FCTSolver(
-        const std::shared_ptr< grid::shell::DistributedDomain >&        domain,
-        const grid::Grid3DDataVec< ScalarType, 3 >&                     coords_shell,
-        const grid::Grid2DDataScalar< ScalarType >&                     coords_radii,
-        const grid::Grid4DDataScalar< grid::shell::ShellBoundaryFlag >& boundary_mask,
-        const grid::Grid4DDataScalar< grid::NodeOwnershipFlag >&        ownership_mask,
-        const linalg::VectorQ1Vec< ScalarType, 3 >&                     velocity,
-        linalg::VectorQ1Scalar< ScalarType >&                           T,
-        linalg::VectorFVScalar< ScalarType >&                           T_fct,
-        const linalg::VectorFVVec< ScalarType, 3 >&                     fv_cell_centers,
-        const fv::hex::DirichletBCs< ScalarType >&                      fct_bcs,
-        const Parameters&                                               prm,
-        std::shared_ptr< util::Table >                                  table )
-    : domain_( domain )
-    , coords_shell_( coords_shell )
-    , coords_radii_( coords_radii )
-    , boundary_mask_( boundary_mask )
-    , velocity_( velocity )
-    , T_( T )
-    , T_fct_( T_fct )
-    , fv_cell_centers_( fv_cell_centers )
-    , fct_bcs_( fct_bcs )
-    , prm_( prm )
-    , table_( std::move( table ) )
-    , T_source_( "T_source", *domain_ )
-    , fv_fct_bufs_( *domain_ )
-    {
-        // FCT Picard backup: only touched when iterating; leave empty otherwise.
-        if ( prm_.time_stepping_parameters.picard_iterations > 1 )
-            T_fct_backup_ = linalg::VectorFVScalar< ScalarType >( "T_fct_backup", *domain_ );
-
-        linalg::assign( T_source_, ScalarType( 0 ) );
-
-        // l2_project_fv_to_fe needs at least 5 Q1 scalar temporaries.
-        constexpr int num_l2_proj_tmps = 5;
-        l2_proj_tmps_.reserve( num_l2_proj_tmps );
-        for ( int i = 0; i < num_l2_proj_tmps; ++i )
-        {
-            l2_proj_tmps_.emplace_back( "fct_l2_proj_tmp_" + std::to_string( i ), *domain_, ownership_mask );
-        }
-    }
-
-    void snapshot_for_picard() override
-    {
-        if ( prm_.time_stepping_parameters.picard_iterations > 1 )
-            Kokkos::deep_copy( T_fct_backup_.grid_data(), T_fct_.grid_data() );
-    }
-
-    void restore_for_picard() override { Kokkos::deep_copy( T_fct_.grid_data(), T_fct_backup_.grid_data() ); }
-
-    ScalarType compute_dt( const int timestep ) override
-    {
-        const auto dt_stable = fv::hex::operators::compute_dt_stable(
-            *domain_,
-            velocity_,
-            fv_cell_centers_.grid_data(),
-            coords_shell_,
-            coords_radii_,
-            prm_.physics_parameters.thermal_diffusivity_nondim );
-        const auto dt =
-            std::min( prm_.time_stepping_parameters.dt_scaling * dt_stable, prm_.time_stepping_parameters.dt_max );
-
-        util::logroot << "Computing dt (FCT stable) ..." << std::endl;
-        util::logroot << "    dt_stable:                     " << dt_stable * prm_.physics_parameters.calc_time_Ma
-                      << " Ma" << std::endl;
-        util::logroot << "=>  dt (= dt_stable * dt_scaling): " << dt * prm_.physics_parameters.calc_time_Ma << " Ma"
-                      << std::endl;
-        return dt;
-    }
-
-    void step( ScalarType dt, bool /*print_convergence*/ ) override
-    {
-        util::Timer timer_energy( "energy" );
-        util::logroot << "Setting up energy solve ..." << std::endl;
-
-        {
-            util::Timer timer_fct_substeps( "fct_substeps" );
-
-            for ( int i = 0; i < prm_.energy_solver_parameters.energy_substeps; ++i )
-            {
-                util::logroot << "Solving energy (FCT, substep " << i << ") ..." << std::endl;
-
-                {
-                    util::Timer timer_fct_source_step( "fct_explicit_step_updating_source_term" );
-                    if ( prm_.physics_parameters.internal_heating )
-                    {
-                        linalg::assign(
-                            T_source_, prm_.physics_parameters.h_number / prm_.physics_parameters.cp_profile );
-                    }
-                    timer_fct_source_step.stop();
-
-                    util::Timer timer_fct_step( "fct_explicit_step" );
-                    fv::hex::operators::fct_explicit_step(
-                        *domain_,
-                        T_fct_,
-                        velocity_,
-                        fv_cell_centers_.grid_data(),
-                        coords_shell_,
-                        coords_radii_,
-                        dt,
-                        fv_fct_bufs_,
-                        prm_.physics_parameters.thermal_diffusivity_nondim,
-                        T_source_.grid_data(),
-                        /*subtract_divergence=*/true,
-                        boundary_mask_,
-                        fct_bcs_ );
-                    timer_fct_step.stop();
-                }
-
-                fv::hex::apply_dirichlet_bcs( T_fct_, boundary_mask_, fct_bcs_, *domain_ );
-            }
-
-            timer_fct_substeps.stop();
-        }
-
-        // Project T_fct -> Q1 T once after all substeps.
-        {
-            util::Timer timer_fct_projection( "fct_l2_projection" );
-            fv::hex::l2_project_fv_to_fe_lumped( T_, T_fct_, *domain_, coords_shell_, coords_radii_, l2_proj_tmps_ );
-
-            // Enforce Dirichlet BCs on the Q1 temperature.
-            auto       T_grid    = T_.grid_data();
-            auto       mask      = boundary_mask_;
-            const auto T_cmb_val = static_cast< ScalarType >( prm_.boundary_parameters.temperature_max );
-            const auto T_top_val = static_cast< ScalarType >( prm_.boundary_parameters.temperature_min );
-            Kokkos::parallel_for(
-                "enforce_T_dirichlet_bcs",
-                grid::shell::local_domain_md_range_policy_nodes( *domain_ ),
-                KOKKOS_LAMBDA( const int sd, const int x, const int y, const int r ) {
-                    const auto flag = mask( sd, x, y, r );
-                    if ( flag == grid::shell::ShellBoundaryFlag::CMB )
-                        T_grid( sd, x, y, r ) = T_cmb_val;
-                    else if ( flag == grid::shell::ShellBoundaryFlag::SURFACE )
-                        T_grid( sd, x, y, r ) = T_top_val;
-                } );
-            Kokkos::fence();
-        }
-    }
-
-  private:
-    std::shared_ptr< grid::shell::DistributedDomain >               domain_;
-    const grid::Grid3DDataVec< ScalarType, 3 >&                     coords_shell_;
-    const grid::Grid2DDataScalar< ScalarType >&                     coords_radii_;
-    const grid::Grid4DDataScalar< grid::shell::ShellBoundaryFlag >& boundary_mask_;
-    const linalg::VectorQ1Vec< ScalarType, 3 >&                     velocity_;
-    linalg::VectorQ1Scalar< ScalarType >&                           T_;
-    linalg::VectorFVScalar< ScalarType >&                           T_fct_;
-    const linalg::VectorFVVec< ScalarType, 3 >&                     fv_cell_centers_;
-    const fv::hex::DirichletBCs< ScalarType >&                      fct_bcs_;
-    const Parameters&                                               prm_;
-    std::shared_ptr< util::Table >                                  table_;
-
-    // Owned scratch.
-    linalg::VectorFVScalar< ScalarType >                T_source_;
-    linalg::VectorFVScalar< ScalarType >                T_fct_backup_;
-    fv::hex::operators::FVFCTBuffers< ScalarType >      fv_fct_bufs_;
-    std::vector< linalg::VectorQ1Scalar< ScalarType > > l2_proj_tmps_;
-};
-
 } // namespace terra::mantlecirculation

@@ -122,10 +122,10 @@ void compare_at_level( plates::PlateVelocityProvider& oracle, const int level, c
     const auto  stencil_device = plates::make_averaging_stencil( stencil_host );
 
     plates::extract_plate_velocities< ScalarType >(
-        domain, coords, radii_grid, stage.device(), stencil_device, device_v, ScalarType( 1 ) );
+        domain, coords, radii_grid, stage.data(), stencil_device, device_v, ScalarType( 1 ) );
 
     // ---- compare, split by regime -------------------------------------------------------------------------
-    const auto stage_views = stage.device();
+    const auto stage_views = stage.data();
     const auto reach_km    = stencil_device.maxDistanceKm;
 
     ScalarType max_plain = 0, max_avg = 0, max_mag = 0;

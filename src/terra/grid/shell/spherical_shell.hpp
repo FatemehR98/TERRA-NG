@@ -795,8 +795,8 @@ inline mpi::MPIRank subdomain_to_rank_iterate_diamond_subdomains(
 
 /// @brief Information about the thick spherical shell mesh.
 ///
-/// @note If you want to create a domain for an application, use the \ref DistributedDomain class, which constructs an
-///       instance of this class internally.
+/// @note If you want to create a domain for an application, use the \ref terra::grid::shell::DistributedDomain
+/// "DistributedDomain" class, which constructs an instance of this class internally.
 ///
 /// **General information**
 ///
@@ -2563,8 +2563,8 @@ class SubdomainNeighborhood
 /// @brief Parallel data structure organizing the thick spherical shell metadata for distributed (MPI parallel)
 ///        simulations.
 ///
-/// This is essentially a wrapper for the \ref DomainInfo and the neighborhood information (\ref SubdomainNeighborhood)
-/// for all process-local subdomains.
+/// This is essentially a wrapper for the \ref terra::grid::shell::DistributedDomain "DomainInfo" and the
+/// neighborhood information (\ref SubdomainNeighborhood) for all process-local subdomains.
 class DistributedDomain
 {
   public:

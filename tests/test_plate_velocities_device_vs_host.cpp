@@ -27,9 +27,8 @@
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
-#include <string>
-
 #include <mpi.h>
+#include <string>
 
 #include "grid/bit_masks.hpp"
 #include "grid/grid_types.hpp"
@@ -47,8 +46,7 @@ using util::logroot;
 
 using ScalarType = double;
 
-namespace
-{
+namespace {
 
 constexpr int kSkipExitCode = 77;
 
@@ -63,16 +61,16 @@ void check( const bool ok, const std::string& what )
     }
 }
 
+/// "Not found" sentinel shared by both paths, so found/not-found disagreements show up as id mismatches.
+constexpr long long kNoPlate = -1;
+
 /// Runs both extractions on one mesh and compares them, split by averaging regime.
-void compare_at_level(
-    plates::PlateVelocityProvider& oracle,
-    const int                      level,
-    const double                   age )
+void compare_at_level( plates::PlateVelocityProvider& oracle, const int level, const double age )
 {
-    const auto radii = grid::shell::uniform_shell_radii< double >( 0.55, 1.0, ( 1 << level ) + 1 );
+    const auto radii  = grid::shell::uniform_shell_radii< double >( 0.55, 1.0, ( 1 << level ) + 1 );
     const auto domain = grid::shell::DistributedDomain::create_uniform( level, radii, 0, 0 );
 
-    const auto coords = grid::shell::subdomain_unit_sphere_single_shell_coords< ScalarType >( domain );
+    const auto coords     = grid::shell::subdomain_unit_sphere_single_shell_coords< ScalarType >( domain );
     const auto radii_grid = grid::shell::subdomain_shell_radii< ScalarType >( domain );
 
     auto ownership = grid::setup_node_ownership_mask_data( domain );
@@ -96,7 +94,7 @@ void compare_at_level(
         auto radii_h  = Kokkos::create_mirror_view( radii_grid );
         Kokkos::deep_copy( coords_h, coords );
         Kokkos::deep_copy( radii_h, radii_grid );
-        auto host_h   = create_mirror( Kokkos::HostSpace{}, host_v );
+        auto host_h = create_mirror( Kokkos::HostSpace{}, host_v );
         for ( int d = 0; d < 3; ++d )
             Kokkos::deep_copy( host_h.comp_[d], ScalarType( 0 ) );
 
@@ -120,7 +118,7 @@ void compare_at_level(
     for ( int d = 0; d < 3; ++d )
         Kokkos::deep_copy( device_v.comp_[d], ScalarType( 0 ) );
 
-    const auto& stage         = oracle.stageFor( age );
+    const auto& stage          = oracle.stageFor( age );
     const auto  stencil_device = plates::make_averaging_stencil( stencil_host );
 
     plates::extract_plate_velocities< ScalarType >(
@@ -136,21 +134,28 @@ void compare_at_level(
     Kokkos::parallel_reduce(
         "compare_host_device",
         grid::shell::local_domain_md_range_policy_nodes( domain ),
-        KOKKOS_LAMBDA( const int sd, const int x, const int y, const int r, ScalarType& plain, ScalarType& avg,
-                       ScalarType& mag, long long& cnt_plain, long long& cnt_avg ) {
+        KOKKOS_LAMBDA(
+            const int   sd,
+            const int   x,
+            const int   y,
+            const int   r,
+            ScalarType& plain,
+            ScalarType& avg,
+            ScalarType& mag,
+            long long&  cnt_plain,
+            long long&  cnt_avg ) {
             if ( boundary( sd, x, y, r ) != grid::shell::ShellBoundaryFlag::SURFACE )
                 return;
             if ( !util::has_flag( ownership( sd, x, y, r ), grid::NodeOwnershipFlag::OWNED ) )
                 return;
 
-            const auto c = grid::shell::coords( sd, x, y, r, coords, radii_grid );
+            const auto                    c = grid::shell::coords( sd, x, y, r, coords, radii_grid );
             const dense::Vec< double, 3 > lonLat =
                 plates::conversions::cart2sph( dense::Vec< double, 3 >{ c( 0 ), c( 1 ), c( 2 ) } );
-            const auto hit = plates::findPlateInStage(
-                stage_views, plates::geometry::lonLatDegToUnit( lonLat( 0 ), lonLat( 1 ) ) );
+            const auto hit =
+                plates::findPlateInStage( stage_views, plates::geometry::lonLatDegToUnit( lonLat( 0 ), lonLat( 1 ) ) );
 
-            const bool averaged =
-                hit.found && reach_km >= hit.distanceRad * plates::constants::earthRadiusInKm;
+            const bool averaged = hit.found && reach_km >= hit.distanceRad * plates::constants::earthRadiusInKm;
 
             if ( averaged )
                 cnt_avg += 1;
@@ -159,8 +164,7 @@ void compare_at_level(
 
             for ( int d = 0; d < 3; ++d )
             {
-                const ScalarType e =
-                    Kokkos::abs( host_v( sd, x, y, r, d ) - device_v( sd, x, y, r, d ) );
+                const ScalarType e = Kokkos::abs( host_v( sd, x, y, r, d ) - device_v( sd, x, y, r, d ) );
                 if ( averaged )
                     avg = Kokkos::max( avg, e );
                 else
@@ -179,10 +183,77 @@ void compare_at_level(
     const ScalarType rel_avg   = max_mag > 0 ? max_avg / max_mag : 0;
 
     logroot << "  level " << level << ", age " << age << " Ma\n"
-            << "    unaveraged nodes " << n_plain << ", max rel diff " << std::scientific
-            << std::setprecision( 4 ) << rel_plain << "\n"
-            << "    averaged   nodes " << n_avg << ", max rel diff " << rel_avg << std::defaultfloat
-            << std::endl;
+            << "    unaveraged nodes " << n_plain << ", max rel diff " << std::scientific << std::setprecision( 4 )
+            << rel_plain << "\n"
+            << "    averaged   nodes " << n_avg << ", max rel diff " << rel_avg << std::defaultfloat << std::endl;
+
+    // ---- plate id comparison at ALL surface nodes ----------------------------------------------------------
+    // Device: run findPlateInStage on every surface node (owned or not) and store the plate id.
+    Kokkos::View< long long***, Kokkos::DefaultExecutionSpace > dev_ids( "dev_plate_ids", num_sub, n_lat, n_lat );
+
+    const int r_surf = n_rad - 1;
+    Kokkos::parallel_for(
+        "plate_ids_device",
+        Kokkos::MDRangePolicy< Kokkos::DefaultExecutionSpace, Kokkos::Rank< 3 > >(
+            { 0, 0, 0 }, { num_sub, n_lat, n_lat } ),
+        KOKKOS_LAMBDA( const int sd, const int x, const int y ) {
+            const auto                    c = grid::shell::coords( sd, x, y, r_surf, coords, radii_grid );
+            const dense::Vec< double, 3 > lonLat =
+                plates::conversions::cart2sph( dense::Vec< double, 3 >{ c( 0 ), c( 1 ), c( 2 ) } );
+            const auto hit =
+                plates::findPlateInStage( stage_views, plates::geometry::lonLatDegToUnit( lonLat( 0 ), lonLat( 1 ) ) );
+            dev_ids( sd, x, y ) = hit.found ? static_cast< long long >( hit.plateId ) : kNoPlate;
+        } );
+    Kokkos::fence();
+
+    auto dev_ids_h = Kokkos::create_mirror_view_and_copy( Kokkos::HostSpace{}, dev_ids );
+
+    // Host: query the oracle at the same points.
+    long long n_id_total = 0, n_id_mismatch = 0, n_id_found_mismatch = 0;
+    {
+        auto coords_h = Kokkos::create_mirror_view( coords );
+        auto radii_h  = Kokkos::create_mirror_view( radii_grid );
+        Kokkos::deep_copy( coords_h, coords );
+        Kokkos::deep_copy( radii_h, radii_grid );
+
+        constexpr int kMaxReport = 5;
+        int           reported   = 0;
+
+        for ( int sd = 0; sd < num_sub; ++sd )
+            for ( int x = 0; x < n_lat; ++x )
+                for ( int y = 0; y < n_lat; ++y )
+                {
+                    const auto                    c = grid::shell::coords( sd, x, y, r_surf, coords_h, radii_h );
+                    const dense::Vec< double, 3 > cart{ c( 0 ), c( 1 ), c( 2 ) };
+
+                    const auto      raw = oracle.findPlateID( cart, age );
+                    const long long id_host =
+                        ( raw == oracle.idWhenNoPlateFound ) ? kNoPlate : static_cast< long long >( raw );
+                    const long long id_dev = dev_ids_h( sd, x, y );
+
+                    ++n_id_total;
+                    if ( id_host != id_dev )
+                    {
+                        ++n_id_mismatch;
+                        if ( ( id_host == kNoPlate ) != ( id_dev == kNoPlate ) )
+                            ++n_id_found_mismatch;
+
+                        if ( reported++ < kMaxReport )
+                        {
+                            const auto ll = plates::conversions::cart2sph( cart );
+                            logroot << "    plate id mismatch at sd " << sd << " (" << x << "," << y << ")"
+                                    << " lon/lat " << ll( 0 ) << "/" << ll( 1 ) << ": host " << id_host << ", device "
+                                    << id_dev << std::endl;
+                        }
+                    }
+                }
+    }
+
+    logroot << "    plate ids: " << n_id_total << " nodes, " << n_id_mismatch << " mismatches (" << n_id_found_mismatch
+            << " found/not-found disagreements)" << std::endl;
+
+    check( n_id_total > 0, "no nodes were compared for plate ids" );
+    check( n_id_mismatch == 0, "device and host disagree on the plate id at some surface nodes" );
 
     check( max_mag > 0, "host produced an all-zero velocity field, so the comparison is vacuous" );
     check( n_plain > 0, "no nodes exercised the unaveraged path" );
@@ -242,13 +313,15 @@ int main( int argc, char** argv )
 
     // Two resolutions: the coarse one is quick, the finer one puts many more nodes near plate boundaries and
     // so exercises the averaged branch harder.
-    compare_at_level( oracle, 4, 0.0 );
-    compare_at_level( oracle, 5, 0.0 );
+    for ( int i = 0; i <= 410; i++ )
+    {
+        // compare_at_level( oracle, 4, i );
+        compare_at_level( oracle, 5, i );
+    }
 
     int failures = g_failures;
     MPI_Allreduce( MPI_IN_PLACE, &failures, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD );
 
-    logroot << "\ntest_plate_velocities_device_vs_host: " << ( failures == 0 ? "PASSED" : "FAILED" )
-            << std::endl;
+    logroot << "\ntest_plate_velocities_device_vs_host: " << ( failures == 0 ? "PASSED" : "FAILED" ) << std::endl;
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -206,6 +206,8 @@ struct PhysicsParameters
     bool   internal_heating      = false;
     double internal_heating_rate = 3e-12;
 
+    bool shear_heating = false;
+
     bool             compressible      = false;
     CompressibleForm compressible_form = CompressibleForm::TALA;
 
@@ -221,9 +223,6 @@ struct PhysicsParameters
     std::string density_profile_value_key = "rho (kg/m^3)";
     std::string alpha_profile_value_key   = "alpha (1/K)";
     std::string cp_profile_value_key      = "Cp (J/kg K)";
-
-    double alpha_profile = 1.0;
-    double cp_profile    = 1.0;
 
     ViscosityParameters          viscosity_parameters{};
     InitialTemperatureParameters initial_temperature{};
@@ -288,17 +287,12 @@ struct StokesSolverParameters
 };
 
 /// Time-discretization scheme for the energy (temperature) equation.
-///   FCT  : explicit Flux-Corrected Transport on the FV mesh.  Low-order upwind
-///          predictor + Zalesak limiter (monotone, no over/undershoots).
-///          Stability bound: dt <= dt_stable (computed from advective + diffusive
-///          face fluxes).  Cheap per step but requires small dt at high velocity / Pe.
 ///   SUPG : implicit SUPG-stabilised Galerkin advection-diffusion on the Q1 mesh,
 ///          solved by FGMRES.  Unconditionally stable (dt only bounded by the
 ///          *advection* CFL for accuracy), so allows much larger dt at moderate Pe.
 ///          Linear-solver convergence degrades at high Pe (Ra >> 1e6).
 enum class EnergySolverType
 {
-    FCT,
     SUPG,
     ENTROPY_VISCOSITY,
 };
@@ -329,7 +323,7 @@ struct EnergySolverParameters
 
 struct TimeSteppingParameters
 {
-    double dt_scaling = 0.5;
+    double cfl_number = 0.5;
     double t_end_Ma   = 100.0;
     double t_end      = 1.0;
     double dt_max_Ma  = 5.0;
@@ -563,7 +557,7 @@ inline util::Result< std::variant< CLIHelp, Parameters > > parse_parameters( int
 
     add_option_with_default( app, "--radius-surface", parameters.mesh_parameters.radius_surface_m )->group( "Domain" );
     add_option_with_default( app, "--radius-cmb", parameters.mesh_parameters.radius_cmb_m )->group( "Domain" );
-    
+
     if ( parameters.devel_parameters.extended_parameters )
     {
         add_option_with_default( app, "--radial-extra-levels", parameters.mesh_parameters.radial_extra_levels )
@@ -631,7 +625,7 @@ inline util::Result< std::variant< CLIHelp, Parameters > > parse_parameters( int
         ->group( "Boundary Conditions" );
 
     // Plate parameters
-    add_option_with_default(
+    add_flag_with_default(
         app, "--apply-plate-velocities", parameters.boundary_parameters.plate_parameters.apply_plate_velocities )
         ->group( "Plate Parameters" )
         ->description(
@@ -671,6 +665,8 @@ inline util::Result< std::variant< CLIHelp, Parameters > > parse_parameters( int
     /// Geophysical parameters ///
     //////////////////////////////
     add_flag_with_default( app, "--compressible", parameters.physics_parameters.compressible )
+        ->group( "Physical Parameters" );
+    add_flag_with_default( app, "--shear-heating", parameters.physics_parameters.shear_heating )
         ->group( "Physical Parameters" );
 
     std::map< std::string, CompressibleForm > compressible_form_map{
@@ -823,12 +819,11 @@ inline util::Result< std::variant< CLIHelp, Parameters > > parse_parameters( int
     /// Time discretization ///
     ///////////////////////////
 
-    add_option_with_default( app, "--dt-scaling", parameters.time_stepping_parameters.dt_scaling )
+    add_option_with_default( app, "--cfl-number", parameters.time_stepping_parameters.cfl_number )
         ->description(
-            "A robust (stable) dt is computed the the actual face-normal velocity fluxes and cell volumes via a "
-            "parallel reduce over all cells. However, a smaller value might still be desired due to accuracy "
-            "considerations. You can scale the computed dt using this value (e.g. set to 0.5 to half the estimated dt, "
-            "set to 1.0 to just use the estimated dt)." )
+            "Courant number C used to compute the timestep dt = C * h_min / v_max. It is chosen for accuracy "
+            "(and, for EV, stability of the explicit viscosity term), not for advective stability. "
+            "Typical values are <= 0.5 (SUPG, EV)." )
         ->group( "Time Discretization" );
     add_option_with_default( app, "--t-end", parameters.time_stepping_parameters.t_end_Ma )
         ->group( "Time Discretization" )
@@ -923,7 +918,6 @@ inline util::Result< std::variant< CLIHelp, Parameters > > parse_parameters( int
     /////////////////////
 
     std::map< std::string, EnergySolverType > energy_solver_map{
-        { "fct", EnergySolverType::FCT },
         { "supg", EnergySolverType::SUPG },
         { "entropy_viscosity", EnergySolverType::ENTROPY_VISCOSITY },
         { "ev", EnergySolverType::ENTROPY_VISCOSITY },
@@ -933,8 +927,9 @@ inline util::Result< std::variant< CLIHelp, Parameters > > parse_parameters( int
         ->transform( CLI::CheckedTransformer( energy_solver_map, CLI::ignore_case ) )
         ->default_val( "ev" )
         ->group( "Energy Solver" )
-        ->description( "'fct': Explicit FCT advection-diffusion (default). "
-                       "'supg': Implicit SUPG advection-diffusion with FGMRES solver." );
+        ->description(
+            "'ev': Implicit Galerkin advection-diffusion with entropy-viscosity stabilization (Guermond et. al, 2011, Kronbichler et. al, 2012) (default). "
+            "'supg': Implicit SUPG advection-diffusion with FGMRES solver." );
 
     add_option_with_default( app, "--energy-krylov-restart", parameters.energy_solver_parameters.krylov_restart )
         ->group( "Energy Solver" );

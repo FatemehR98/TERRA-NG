@@ -86,9 +86,9 @@ struct SolutionVelocityInterpolator
     : grid_( grid )
     , radii_( radii )
     , data_u_( data_u )
+    , only_boundary_( only_boundary )
     , r_min_( r_min )
     , alpha_( alpha )
-    , only_boundary_( only_boundary )
     {}
 
     KOKKOS_INLINE_FUNCTION

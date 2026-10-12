@@ -51,9 +51,6 @@ class EpsilonDivDivKerngenV03TeamsPrecomp
     linalg::OperatorCommunicationMode operator_communication_mode_;
     linalg::OperatorStoredMatrixMode  operator_stored_matrix_mode_;
 
-    communication::shell::SubdomainNeighborhoodSendRecvBuffer< ScalarT, VecDim > send_buffers_;
-    communication::shell::SubdomainNeighborhoodSendRecvBuffer< ScalarT, VecDim > recv_buffers_;
-
     grid::Grid4DDataVec< ScalarType, VecDim > src_;
     grid::Grid4DDataVec< ScalarType, VecDim > dst_;
 
@@ -77,6 +74,9 @@ class EpsilonDivDivKerngenV03TeamsPrecomp
     int blocks_per_column_;
     int blocks_;
 
+    communication::shell::SubdomainNeighborhoodSendRecvBuffer< ScalarT, VecDim > send_buffers_;
+    communication::shell::SubdomainNeighborhoodSendRecvBuffer< ScalarT, VecDim > recv_buffers_;
+
   public:
     EpsilonDivDivKerngenV03TeamsPrecomp(
         const grid::shell::DistributedDomain&                           domain,
@@ -93,8 +93,8 @@ class EpsilonDivDivKerngenV03TeamsPrecomp
     : domain_( domain )
     , grid_( grid )
     , radii_( radii )
-    , mask_( mask )
     , k_( k )
+    , mask_( mask )
     , treat_boundary_( true )
     , diagonal_( diagonal )
     , operator_apply_mode_( operator_apply_mode )

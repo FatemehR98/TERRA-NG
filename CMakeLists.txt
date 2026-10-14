@@ -26,7 +26,7 @@ if( TNG_COLOUR_COMPILER_OUTPUT )
 endif()
 
 # Suppress selected compiler warnings
-set( TNG_SUPPRESS_WARNINGS "-Wno-unknown-pragmas" CACHE STRING "Suppress certain compiler warnings" )
+set( TNG_SUPPRESS_WARNINGS "-Wno-unknown-pragmas -Wno-sign-compare" CACHE STRING "Suppress certain compiler warnings" )
 mark_as_advanced( TNG_SUPPRESS_WARNINGS )
 if( NOT "${TNG_SUPPRESS_WARNINGS}" STREQUAL "" )
   separate_arguments( TNG_SUPPRESS_LIST NATIVE_COMMAND "${TNG_SUPPRESS_WARNINGS}" )

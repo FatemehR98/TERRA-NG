@@ -23,6 +23,9 @@ mark_as_advanced( TNG_COLOUR_COMPILER_OUTPUT )
 if( TNG_COLOUR_COMPILER_OUTPUT )
   add_compile_options($<$<CXX_COMPILER_ID:Clang>:-fdiagnostics-color=always>)
   add_compile_options($<$<CXX_COMPILER_ID:GNU>:-fdiagnostics-color=always>)
+  if( CMAKE_CXX_COMPILER_ID MATCHES "NVHPC" )
+    add_compile_options( -Xcompiler -fdiagnostics-color=always )
+  endif()
 endif()
 
 # Suppress selected compiler warnings

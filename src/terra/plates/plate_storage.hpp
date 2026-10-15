@@ -19,7 +19,7 @@
 
 #include <algorithm>
 
-#include "terra/plates/json.hpp" // question : 
+#include "terra/plates/json.hpp" // question :
                                  // should we include this file or is there an internal JSON handler included already ?
                                  // For now I will include it in the same folder till we know :)
 
@@ -31,8 +31,8 @@
 #include "terra/plates/utilities.hpp"
 #include "util/logging.hpp"
 
-using terra::util::logroot;
 using terra::util::logall;
+using terra::util::logroot;
 
 using uint_t = unsigned int;
 
@@ -83,12 +83,12 @@ class PlateStorage
         }
         // if ( mpi::rank == 0 )
         // {
-            logroot << "PlateStorage object:\n"
-                      << " - stores plates for " << ageToPlatesMap_.size() << " age stages\n"
-                      << " - stores a total of " << nPlates << " plates\n"
-                      << " - age stages range from " << *listOfPlateStages_.begin() << " to "
-                      << listOfPlateStages_.back() << " Ma\n"
-                      << " - data was obtained from file = '" << srcFile_ << "'" << std::endl;
+        logroot << "PlateStorage object:\n"
+                << " - stores plates for " << ageToPlatesMap_.size() << " age stages\n"
+                << " - stores a total of " << nPlates << " plates\n"
+                << " - age stages range from " << *listOfPlateStages_.begin() << " to " << listOfPlateStages_.back()
+                << " Ma\n"
+                << " - data was obtained from file = '" << srcFile_ << "'" << std::endl;
         // }
     }
 

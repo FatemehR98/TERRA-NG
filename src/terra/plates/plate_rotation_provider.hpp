@@ -18,6 +18,7 @@
 #pragma once
 #include <string>
 #include <vector>
+
 #include "terra/plates/types.hpp"
 // #include "terraneo/dataimport/file_io.hpp"
 
@@ -31,17 +32,17 @@ namespace plates {
 /// and provides access to it.
 class PlateRotationProvider
 {
- public:
-   template < typename ImportStrategy >
-   PlateRotationProvider( std::string nameOfRotationsFile, ImportStrategy readRotationsFile )
-   {
-      rotInfos_ = readRotationsFile( nameOfRotationsFile );
-   }
+  public:
+    template < typename ImportStrategy >
+    PlateRotationProvider( std::string nameOfRotationsFile, ImportStrategy readRotationsFile )
+    {
+        rotInfos_ = readRotationsFile( nameOfRotationsFile );
+    }
 
-   const std::vector< RotationInfo >& getRotations() const { return rotInfos_; };
+    const std::vector< RotationInfo >& getRotations() const { return rotInfos_; };
 
- private:
-   std::vector< RotationInfo > rotInfos_;
+  private:
+    std::vector< RotationInfo > rotInfos_;
 };
 
 } // namespace plates

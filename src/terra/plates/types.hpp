@@ -30,7 +30,7 @@ namespace plates {
 
 using uint_t = unsigned int;
 
-inline constexpr long double pi = 3.14159265358979323846L;
+inline constexpr double pi = 3.14159265358979323846;
 
 /// Struct to bundle information on the rotation of a plate
 struct RotationInfo

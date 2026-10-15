@@ -22,12 +22,11 @@
 // #include "terraneo/helpers/typeAliases.hpp"
 #include "terra/dense/vec.hpp"
 #include "terra/kokkos/kokkos_wrapper.hpp"
+#include "terra/plates/types.hpp"
 
 using vec3D = terra::dense::Vec< double, 3 >;
 namespace terra {
 namespace plates::conversions {
-
-inline constexpr double pi = 3.14159265358979323846;
 
 /// Transforms angle from degrees to radians
 KOKKOS_INLINE_FUNCTION double degToRad( double degree )

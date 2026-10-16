@@ -341,7 +341,8 @@ Result<> run( const Parameters& prm )
             ( *domains[velocity_level] ),
             coords_shell[velocity_level],
             coords_radii[velocity_level],
-            boundary_mask_data[velocity_level] );
+            boundary_mask_data[velocity_level],
+            ownership_mask_data[velocity_level] );
 
         // Stress has the same scale as the pressure.
         const ScalarType stress_scale =

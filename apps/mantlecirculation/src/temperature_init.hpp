@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -211,21 +212,55 @@ void initialize_temperature_fields(
                 KOKKOS_LAMBDA( int id, int x, int y ) { sph_coeffs( id, x, y ) /= max_abs_sph; } );
             Kokkos::fence();
 
+            SphericalHarmonicPerturbationAdder adder{
+                init_temp.perturbation_amplitude,
+                prm.boundary_parameters.temperature_min,
+                prm.boundary_parameters.temperature_max,
+                prm.mesh_parameters.radius_min,
+                prm.mesh_parameters.radius_max,
+                true, /*taper_near_boundaries*/
+                coords_radii,
+                sph_coeffs,
+                T.grid_data(),
+                ownership_mask };
+
+            // Optionally restrict the perturbation to a single radial layer
+            if ( init_temp.sph_layer >= 0 )
+            {
+                const auto& radii      = domain.domain_info().radii();
+                const int   num_layers = static_cast< int >( radii.size() ) - 1;
+
+                if ( init_temp.sph_layer >= num_layers )
+                {
+                    Kokkos::abort(
+                        ( "--initial-temperature-sph-layer = " + std::to_string( init_temp.sph_layer ) +
+                          " is out of range: the mesh has " + std::to_string( num_layers ) +
+                          " radial layers (valid: 0 ... " + std::to_string( num_layers - 1 ) + ")." )
+                            .c_str() );
+                }
+
+                const int    i      = init_temp.sph_layer;
+                const double r_lo   = radii[i];
+                const double r_hi   = radii[i + 1];
+                double       min_dr = r_hi - r_lo;
+                for ( int k = 0; k < num_layers; ++k )
+                {
+                    min_dr = std::min( min_dr, radii[k + 1] - radii[k] );
+                }
+
+                adder.restrict_to_layer_ = true;
+                adder.layer_r_lo_        = static_cast< ScalarType >( r_lo );
+                adder.layer_r_hi_        = static_cast< ScalarType >( r_hi );
+                adder.layer_tol_         = static_cast< ScalarType >( 0.25 * min_dr );
+
+                util::logroot << "Restricting spherical harmonic perturbation to radial layer " << i << " of "
+                              << num_layers << " (r in [" << r_lo << ", " << r_hi << "], nondimensional)"
+                              << std::endl;
+            }
+
             // Add spherical harmonic perturbation
             Kokkos::parallel_for(
-                "SphericalHarmonicPerturbationAdder",
-                grid::shell::local_domain_md_range_policy_nodes( domain ),
-                SphericalHarmonicPerturbationAdder{
-                    init_temp.perturbation_amplitude,
-                    prm.boundary_parameters.temperature_min,
-                    prm.boundary_parameters.temperature_max,
-                    prm.mesh_parameters.radius_min,
-                    prm.mesh_parameters.radius_max,
-                    true, /*taper_near_boundaries*/
-                    coords_radii,
-                    sph_coeffs,
-                    T.grid_data(),
-                    ownership_mask } );
+                "SphericalHarmonicPerturbationAdder", grid::shell::local_domain_md_range_policy_nodes( domain ), adder );
             Kokkos::fence();
 
             // Communicate to ghost nodes

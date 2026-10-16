@@ -330,6 +330,62 @@ Result<> run( const Parameters& prm )
         xdmf_output_pressure->add( u.block_2().grid_data() ); // Pressure
     }
 
+    // Radial stress on surface and CMB (consistent boundary flux), each written as a 2D boundary mesh.
+    std::optional< BoundaryRadialStressCBF > radial_stress;
+    std::optional< BoundaryXDMFOutput >      xdmf_output_surface;
+    std::optional< BoundaryXDMFOutput >      xdmf_output_cmb;
+
+    if ( prm.io_parameters.output_radial_stress )
+    {
+        radial_stress.emplace(
+            ( *domains[velocity_level] ),
+            coords_shell[velocity_level],
+            coords_radii[velocity_level],
+            boundary_mask_data[velocity_level] );
+
+        // Stress has the same scale as the pressure.
+        const ScalarType stress_scale =
+            prm.devel_parameters.output_dimensional ?
+                prm.physics_parameters.viscosity_parameters.reference_viscosity *
+                    prm.physics_parameters.characteristic_velocity / prm.mesh_parameters.mantle_thickness_m :
+                ScalarType( 1 );
+
+        const auto pad_width = std::to_string(
+                                   prm.time_stepping_parameters.timestep_initial +
+                                   prm.time_stepping_parameters.max_timesteps - 1 )
+                                   .size();
+
+        for ( const bool at_surface : { true, false } )
+        {
+            auto& out = at_surface ? xdmf_output_surface : xdmf_output_cmb;
+            out.emplace(
+                prm.io_parameters.outdir + "/" + prm.io_parameters.xdmf_dir + ( at_surface ? "_surface" : "_cmb" ),
+                coords_shell[velocity_level],
+                coords_radii[velocity_level],
+                boundary_mask_data[velocity_level],
+                at_surface,
+                coords_scale_factor );
+            out->add( at_surface ? radial_stress->sigma_rr_surface() : radial_stress->sigma_rr_cmb(), stress_scale );
+            out->set_pad_width( pad_width );
+        }
+    }
+
+    // Must be called right after a Stokes solve, with the buoyancy inputs of that solve.
+    auto compute_and_write_radial_stress = [&]( const int timestep ) {
+        if ( !radial_stress )
+            return;
+
+        logroot << "Computing radial stress (CBF) and writing boundary XDMF ..." << std::endl;
+
+        if ( pda_form )
+            radial_stress->compute( stokes.compute_momentum_residual( Tdev, density->grid_data(), alpha_profile ) );
+        else
+            radial_stress->compute( stokes.compute_momentum_residual( Tdev, rho_profile, alpha_profile ) );
+
+        xdmf_output_surface->write( timestep );
+        xdmf_output_cmb->write( timestep );
+    };
+
     // Helper function to gather all xdmf output fields for write_xdmf().
     // Combine with corresponding scaling factor for redimensionalisation and a flag specifying if the nondimensional field should be restored or not.
     auto collect_xdmf_fields = [&]() -> XdmfFields {
@@ -560,6 +616,9 @@ Result<> run( const Parameters& prm )
     if ( !prm.io_parameters.no_xdmf )
     {
         logroot << "Writing initial XDMF ..." << std::endl;
+
+        // Before write_xdmf(), which leaves Tdev redimensionalised.
+        compute_and_write_radial_stress( prm.time_stepping_parameters.timestep_initial );
 
         // Write to xdmf
         auto fields = collect_xdmf_fields();
@@ -793,6 +852,9 @@ Result<> run( const Parameters& prm )
 
         if ( write_output && !prm.io_parameters.no_xdmf )
         {
+            // Before write_xdmf(), which leaves Tdev redimensionalised.
+            compute_and_write_radial_stress( timestep );
+
             // Write to xdmf
             auto fields = collect_xdmf_fields();
 

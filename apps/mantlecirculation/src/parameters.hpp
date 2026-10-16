@@ -170,6 +170,12 @@ struct InitialTemperatureParameters
     int    sph_degree_l_2 = 0;
     int    sph_order_m_2  = 0;
     double sph_factor_2   = 0.0;
+
+    /// Restrict the spherical-harmonic perturbation to a single radial layer (cell layer between
+    /// shells sph_layer and sph_layer + 1, counted from the CMB). -1 = whole domain (default).
+    /// Number of layers is 2^(refinement_level_mesh_max + radial_extra_levels), so valid
+    /// indices are 0 ... num_layers - 1.
+    int sph_layer = -1;
 };
 
 // Work in progress
@@ -344,6 +350,10 @@ struct IOParameters
     bool        overwrite       = false;
     bool        output_pressure = true;
 
+    // Radial stress sigma_rr on surface and CMB (consistent boundary flux), written to
+    // <xdmf_dir>_surface and <xdmf_dir>_cmb.
+    bool output_radial_stress = true;
+
     std::string xdmf_dir                = "xdmf";
     std::string radial_profiles_out_dir = "radial_profiles";
     std::string timer_trees_dir         = "timer_trees";
@@ -365,8 +375,8 @@ struct DeveloperOptions
     bool output_dimensional   = true;
 
     // Some logging and parameter options
-    bool extended_parameters = false; // If false, hide some of the parameters that are not relevant for 'standard' use.
-    bool extended_diagnostics         = true; // Extended logging of solver diagnostics, memory footprint, etc.
+    bool extended_parameters  = true; // If false, hide some of the parameters that are not relevant for 'standard' use.
+    bool extended_diagnostics = true; // Extended logging of solver diagnostics, memory footprint, etc.
     bool print_parameter_descriptions = true;
 };
 
@@ -562,9 +572,10 @@ inline util::Result< std::variant< CLIHelp, Parameters > > parse_parameters( int
     {
         add_option_with_default( app, "--radial-extra-levels", parameters.mesh_parameters.radial_extra_levels )
             ->group( "Anisotropic mesh refinement" )
-            ->description( "Per-MG-level offset added to the radial diamond refinement level relative to the "
-                           "lateral one. Radial level at each MG level L becomes L + radial_extra_levels, so the "
-                           "hierarchy coarsens uniformly in both axes. Default -1." );
+            ->description(
+                "Per-MG-level offset added to the radial diamond refinement level relative to the "
+                "lateral one. Radial level at each MG level L becomes L + radial_extra_levels, so the "
+                "hierarchy coarsens uniformly in both axes. Default -1." );
         add_option_with_default( app, "--lat-sdr", parameters.mesh_parameters.lat_sdr )
             ->group( "Anisotropic mesh refinement" )
             ->description(
@@ -584,14 +595,16 @@ inline util::Result< std::variant< CLIHelp, Parameters > > parse_parameters( int
             ->transform( CLI::CheckedTransformer( radial_distribution_map, CLI::ignore_case ) )
             ->default_val( "uniform" )
             ->group( "Anisotropic mesh refinement" )
-            ->description( "Radial shell distribution: 'uniform' (equispaced, default), 'tanh-both' "
-                           "(cluster at both CMB and surface), 'tanh-cmb' (cluster at CMB only), "
-                           "'tanh-surface' (cluster at surface only).  Cluster strength is set by "
-                           "--radial-cluster-k." );
+            ->description(
+                "Radial shell distribution: 'uniform' (equispaced, default), 'tanh-both' "
+                "(cluster at both CMB and surface), 'tanh-cmb' (cluster at CMB only), "
+                "'tanh-surface' (cluster at surface only).  Cluster strength is set by "
+                "--radial-cluster-k." );
         add_option_with_default( app, "--radial-cluster-k", parameters.mesh_parameters.radial_cluster_k )
             ->group( "Anisotropic mesh refinement" )
-            ->description( "Cluster-strength k for the tanh-based radial distributions.  k <= 0 "
-                           "collapses to uniform; k ~ 1 mild clustering, k ~ 2 strong clustering." );
+            ->description(
+                "Cluster-strength k for the tanh-based radial distributions.  k <= 0 "
+                "collapses to uniform; k ~ 1 mild clustering, k ~ 2 strong clustering." );
     }
 
     ///////////////////////////
@@ -763,9 +776,10 @@ inline util::Result< std::variant< CLIHelp, Parameters > > parse_parameters( int
         ->transform( CLI::CheckedTransformer( init_temp_profile_map, CLI::ignore_case ) )
         ->default_val( "from-file" )
         ->group( "Initial Temperature" )
-        ->description( "'power-law': T = ((r_max-r)/(r_max-r_min))^5 (default). "
-                       "'from-file': read custom temperature profile from file."
-                       "'conductive': T_ref = (r_min*r_max/r - r_min)/(r_max - r_min)." );
+        ->description(
+            "'power-law': T = ((r_max-r)/(r_max-r_min))^5 (default). "
+            "'from-file': read custom temperature profile from file."
+            "'conductive': T_ref = (r_min*r_max/r - r_min)/(r_max - r_min)." );
 
     add_option_with_default(
         app, "--temperature-profile-path", parameters.physics_parameters.initial_temperature.Tref_profile_csv_path )
@@ -815,6 +829,15 @@ inline util::Result< std::variant< CLIHelp, Parameters > > parse_parameters( int
         ->description(
             "Weight factor for second spherical harmonic: T += eps * envelope * (Y_l1^m1 + factor_2 * Y_l2^m2)." );
 
+    add_option_with_default(
+        app, "--initial-temperature-sph-layer", parameters.physics_parameters.initial_temperature.sph_layer )
+        ->group( "Initial Temperature" )
+        ->description(
+            "Restrict the spherical harmonic perturbation to a single radial layer (0 = layer at the CMB). "
+            "Number of layers is 2^(refinement-level-mesh-max + radial-extra-levels), e.g. 16 for level 5 and 32 for "
+            "level 6 with the default radial-extra-levels = -1. Perturbs the nodes on both shells bounding the layer "
+            "(except the CMB/surface shells) without boundary tapering. -1 = whole domain." );
+
     ///////////////////////////
     /// Time discretization ///
     ///////////////////////////
@@ -844,9 +867,10 @@ inline util::Result< std::variant< CLIHelp, Parameters > > parse_parameters( int
         ->description( "Amount of ramp-up timesteps at the beginning of the run." );
     add_option_with_default( app, "--picard-iterations", parameters.time_stepping_parameters.picard_iterations )
         ->group( "Time Discretization" )
-        ->description( "Number of Picard (fixed-point) iterations per timestep. "
-                       "Each iteration re-solves Stokes and energy from the same starting temperature. "
-                       "Default: 1 (no iteration, current behavior)." );
+        ->description(
+            "Number of Picard (fixed-point) iterations per timestep. "
+            "Each iteration re-solves Stokes and energy from the same starting temperature. "
+            "Default: 1 (no iteration, current behavior)." );
 
     /////////////////////
     /// Stokes solver ///
@@ -898,10 +922,11 @@ inline util::Result< std::variant< CLIHelp, Parameters > > parse_parameters( int
     {
         add_option_with_default( app, "--stokes-gca", parameters.stokes_solver_parameters.gca )
             ->group( "Stokes Solver" )
-            ->description( "Galerkin coarse-grid approximation mode for the viscous-block multigrid "
-                           "preconditioner. 0 = disabled (default; coarse operators rediscretised), "
-                           "1 = full GCA (more robust at variable viscosity), "
-                           "2 = adaptive GCA (memory-saving, slightly less robust)." );
+            ->description(
+                "Galerkin coarse-grid approximation mode for the viscous-block multigrid "
+                "preconditioner. 0 = disabled (default; coarse operators rediscretised), "
+                "1 = full GCA (more robust at variable viscosity), "
+                "2 = adaptive GCA (memory-saving, slightly less robust)." );
         app.add_option(
                "--stokes-viscous-pc-agglom-factors",
                parameters.stokes_solver_parameters.viscous_pc_agglom_factors,
@@ -958,6 +983,11 @@ inline util::Result< std::variant< CLIHelp, Parameters > > parse_parameters( int
     add_option_with_default( app, "--outdir", parameters.io_parameters.outdir )->group( "I/O" );
     add_flag_with_default( app, "--outdir-overwrite", parameters.io_parameters.overwrite )->group( "I/O" );
     add_option_with_default( app, "--output-pressure", parameters.io_parameters.output_pressure )->group( "I/O" );
+    add_option_with_default( app, "--output-radial-stress", parameters.io_parameters.output_radial_stress )
+        ->group( "I/O" )
+        ->description(
+            "Write the radial stress sigma_rr on the surface and the CMB (consistent boundary flux method) to "
+            "<xdmf-dir>_surface and <xdmf-dir>_cmb." );
 
     // Checkpoint loading
     add_option_with_default( app, "--load-checkpoint", parameters.io_parameters.load_checkpoint )

@@ -890,6 +890,49 @@ class StokesContext
         linalg::assign( stok_vecs_["u_prev"], stok_vecs_["u"] );
     }
 
+    /// Momentum residual of the current solution for the consistent boundary flux (CBF) method.
+    ///
+    ///   R = A u + B^T p - M b
+    ///
+    /// assembled with the NEUMANN operator, i.e. without any strong BC elimination, so that the rows of
+    /// boundary nodes are complete. By the weak form, the boundary rows then hold the consistent nodal
+    /// traction  R_i = ∫_Γ (σ n) · φ_i dΓ  with σ = 2η ε'(u) - p I and n the outward normal. Interior
+    /// rows are (up to the solver tolerance) zero.
+    ///
+    /// Must be called after solve() with the same buoyancy inputs. The result lives in the block
+    /// preconditioner's scratch vector (idle between solves) and is overwritten by the next solve().
+    template < typename RhoFieldType >
+    const linalg::VectorQ1Vec< ScalarType >& compute_momentum_residual(
+        const linalg::VectorQ1Scalar< ScalarType >& T_for_buoyancy,
+        const RhoFieldType&                         rho,
+        const grid::Grid2DDataScalar< ScalarType >& alpha )
+    {
+        util::Timer timer_residual( "stokes_momentum_residual" );
+
+        auto& tmp = triangular_prec_tmp_;
+        auto& f   = stok_vecs_["f"]; // rebuilt in every solve(), so usable as scratch here
+
+        // Same (unconstrained) buoyancy RHS as in solve(), before BC enforcement.
+        Kokkos::parallel_for(
+            "Stokes residual rhs interpolation",
+            grid::shell::local_domain_md_range_policy_nodes( *domains_[velocity_level_] ),
+            BuoyancyForceAssembly(
+                coords_shell_[velocity_level_],
+                coords_radii_[velocity_level_],
+                tmp.block_1().grid_data(),
+                T_for_buoyancy.grid_data(),
+                rho,
+                alpha,
+                prm_.physics_parameters.rayleigh_number,
+                1.0 ) );
+
+        linalg::apply( *M_, tmp.block_1(), f.block_1() );
+        linalg::apply( *K_neumann_, stok_vecs_["u"], tmp );
+        linalg::lincomb( tmp.block_1(), { 1.0, -1.0 }, { tmp.block_1(), f.block_1() } );
+
+        return tmp.block_1();
+    }
+
   private:
     // Inputs stored BY VALUE so this context owns its dependencies and isn't
     // tied to the lifetime/identity of the mc.cpp locals.  Vectors-of-views

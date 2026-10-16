@@ -1,5 +1,6 @@
 #pragma once
 
+#include "communication/shell/communication.hpp"
 #include "fe/wedge/integrands.hpp"
 #include "fe/wedge/kernel_helpers.hpp"
 #include "grid/grid_types.hpp"
@@ -227,5 +228,174 @@ inline ScalarType compute_v_rms(
 
     return ( sum_dV > ScalarType( 0 ) ) ? Kokkos::sqrt( sum_u2_dV / sum_dV ) : ScalarType( 0 );
 }
+
+/// @brief Adds the lumped boundary mass  m_i = ∫_Γ φ_i dΓ  of the surface or CMB to the boundary layer of `mass`.
+///
+/// The boundary faces of the wedge mesh are flat triangles at a fixed radius, so m_i is exact: one third of the
+/// area of every incident triangle. Only the local contributions are added; nodes on subdomain interfaces must
+/// afterwards be summed with an additive communication.
+inline void add_lumped_boundary_mass(
+    grid::Grid4DDataScalar< ScalarType >&                           mass,
+    const grid::Grid3DDataVec< ScalarType, 3 >&                     coords_shell,
+    const grid::Grid2DDataScalar< ScalarType >&                     coords_radii,
+    const grid::Grid4DDataScalar< grid::shell::ShellBoundaryFlag >& boundary_mask,
+    const bool                                                      at_surface )
+{
+    const int num_subdomains = static_cast< int >( mass.extent( 0 ) );
+    const int nx             = static_cast< int >( mass.extent( 1 ) );
+    const int nr             = static_cast< int >( mass.extent( 3 ) );
+
+    const int  r_b = at_surface ? ( nr - 1 ) : 0;
+    const auto expected_flag =
+        at_surface ? grid::shell::ShellBoundaryFlag::SURFACE : grid::shell::ShellBoundaryFlag::CMB;
+
+    Kokkos::parallel_for(
+        "cbf_lumped_boundary_mass",
+        Kokkos::MDRangePolicy< Kokkos::Rank< 3 > >( { 0, 0, 0 }, { num_subdomains, nx - 1, nx - 1 } ),
+        KOKKOS_LAMBDA( const int sd, const int xc, const int yc ) {
+            if ( boundary_mask( sd, xc, yc, r_b ) != expected_flag )
+                return;
+
+            // Boundary triangles of the two wedges of this hex cell (same node order as
+            // fe::wedge::extract_local_wedge_scalar_coefficients()).
+            const int tri_x[2][3] = { { xc, xc + 1, xc }, { xc + 1, xc, xc + 1 } };
+            const int tri_y[2][3] = { { yc, yc, yc + 1 }, { yc + 1, yc + 1, yc } };
+
+            for ( int w = 0; w < 2; ++w )
+            {
+                const auto p0 = grid::shell::coords( sd, tri_x[w][0], tri_y[w][0], r_b, coords_shell, coords_radii );
+                const auto p1 = grid::shell::coords( sd, tri_x[w][1], tri_y[w][1], r_b, coords_shell, coords_radii );
+                const auto p2 = grid::shell::coords( sd, tri_x[w][2], tri_y[w][2], r_b, coords_shell, coords_radii );
+
+                // ∫_tri φ_i dΓ = |tri| / 3 for linear φ_i on a flat triangle.
+                const ScalarType third_area = ( p1 - p0 ).cross( p2 - p0 ).norm() / ScalarType( 6 );
+
+                for ( int i = 0; i < 3; ++i )
+                    Kokkos::atomic_add( &mass( sd, tri_x[w][i], tri_y[w][i], r_b ), third_area );
+            }
+        } );
+}
+
+/// @brief σ_rr,i = (R_i · n_i) / m_i on the surface or CMB, from the momentum residual R and the lumped
+///        boundary mass (see BoundaryRadialStressCBF). Entries of subdomains not on that boundary are set to 0.
+inline void compute_cbf_radial_stress(
+    grid::Grid3DDataScalar< ScalarType >&                           sigma_rr,
+    const grid::Grid4DDataVec< ScalarType, 3 >&                     residual,
+    const grid::Grid3DDataScalar< ScalarType >&                     boundary_mass,
+    const grid::Grid3DDataVec< ScalarType, 3 >&                     coords_shell,
+    const grid::Grid4DDataScalar< grid::shell::ShellBoundaryFlag >& boundary_mask,
+    const bool                                                      at_surface )
+{
+    const int num_subdomains = static_cast< int >( residual.extent( 0 ) );
+    const int nx             = static_cast< int >( residual.extent( 1 ) );
+    const int nr             = static_cast< int >( residual.extent( 3 ) );
+
+    const int  r_b = at_surface ? ( nr - 1 ) : 0;
+    const auto expected_flag =
+        at_surface ? grid::shell::ShellBoundaryFlag::SURFACE : grid::shell::ShellBoundaryFlag::CMB;
+    const ScalarType normal_sign = at_surface ? ScalarType( 1 ) : ScalarType( -1 );
+
+    Kokkos::parallel_for(
+        "cbf_radial_stress",
+        Kokkos::MDRangePolicy< Kokkos::Rank< 3 > >( { 0, 0, 0 }, { num_subdomains, nx, nx } ),
+        KOKKOS_LAMBDA( const int sd, const int x, const int y ) {
+            if ( boundary_mask( sd, x, y, r_b ) != expected_flag )
+            {
+                sigma_rr( sd, x, y ) = ScalarType( 0 );
+                return;
+            }
+
+            dense::Vec< ScalarType, 3 > r_hat;
+            for ( int d = 0; d < 3; ++d )
+                r_hat( d ) = coords_shell( sd, x, y, d );
+            r_hat = r_hat.normalized();
+
+            ScalarType R_dot_n = 0;
+            for ( int d = 0; d < 3; ++d )
+                R_dot_n += residual( sd, x, y, r_b, d ) * r_hat( d );
+
+            sigma_rr( sd, x, y ) = normal_sign * R_dot_n / boundary_mass( sd, x, y );
+        } );
+}
+
+/// @brief Nodal radial stress σ_rr = r̂ · σ · r̂ on the surface and the CMB via the consistent boundary flux
+///        (CBF) method (Zhong, Gurnis & Hulbert 1993).
+///
+/// Instead of differentiating the FE velocity at the boundary (which is only O(h) accurate and ignores the
+/// body force), the traction is recovered from the momentum residual of the discrete solution:
+///
+///   R_i = ( A u + B^T p - M b )_i = ∫_Γ (σ n) · φ_i dΓ     (boundary node i, outward normal n)
+///
+/// (see StokesContext::compute_momentum_residual()). Lumping the boundary mass matrix gives the nodal traction
+///
+///   t_i = R_i / m_i,   m_i = ∫_Γ φ_i dΓ,
+///
+/// and σ_rr,i = t_i · n_i. Since n = ±r̂ enters twice in n·σ·n, this is r̂·σ·r̂ on both boundaries
+/// (positive = tension, σ includes -p).
+///
+/// The boundary masses depend on the geometry only and are assembled once on construction; compute() then
+/// is a single lightweight kernel per boundary. Everything runs in the default execution space.
+///
+/// Results are stored per subdomain as (subdomain, x, y). Entries of subdomains that do not touch the
+/// respective boundary (radial subdomain decomposition) are zero.
+///
+/// The kernels live in free functions: CUDA does not allow extended (device) lambdas in constructors or in
+/// private member functions.
+class BoundaryRadialStressCBF
+{
+  public:
+    BoundaryRadialStressCBF(
+        const grid::shell::DistributedDomain&                           domain,
+        const grid::Grid3DDataVec< ScalarType, 3 >&                     coords_shell,
+        const grid::Grid2DDataScalar< ScalarType >&                     coords_radii,
+        const grid::Grid4DDataScalar< grid::shell::ShellBoundaryFlag >& boundary_mask )
+    : coords_shell_( coords_shell )
+    , boundary_mask_( boundary_mask )
+    {
+        const int num_subdomains = static_cast< int >( domain.subdomains().size() );
+        const int nx             = domain.domain_info().subdomain_num_nodes_per_side_laterally();
+        const int nr             = domain.domain_info().subdomain_num_nodes_radially();
+
+        // Assemble into a temporary full nodal field so that the contributions of neighbouring subdomains can be
+        // summed with the standard additive communication, then keep only the two boundary layers.
+        grid::Grid4DDataScalar< ScalarType > mass( "cbf_boundary_mass_tmp", num_subdomains, nx, nx, nr );
+
+        add_lumped_boundary_mass( mass, coords_shell, coords_radii, boundary_mask, true );
+        add_lumped_boundary_mass( mass, coords_shell, coords_radii, boundary_mask, false );
+        Kokkos::fence();
+
+        communication::shell::send_recv( domain, mass, communication::CommunicationReduction::SUM );
+
+        mass_surface_ = grid::Grid3DDataScalar< ScalarType >( "cbf_boundary_mass_surface", num_subdomains, nx, nx );
+        mass_cmb_     = grid::Grid3DDataScalar< ScalarType >( "cbf_boundary_mass_cmb", num_subdomains, nx, nx );
+        Kokkos::deep_copy( mass_surface_, Kokkos::subview( mass, Kokkos::ALL, Kokkos::ALL, Kokkos::ALL, nr - 1 ) );
+        Kokkos::deep_copy( mass_cmb_, Kokkos::subview( mass, Kokkos::ALL, Kokkos::ALL, Kokkos::ALL, 0 ) );
+
+        sigma_rr_surface_ = grid::Grid3DDataScalar< ScalarType >( "sigma_rr_surface", num_subdomains, nx, nx );
+        sigma_rr_cmb_     = grid::Grid3DDataScalar< ScalarType >( "sigma_rr_cmb", num_subdomains, nx, nx );
+    }
+
+    /// @brief Computes σ_rr on both boundaries from the momentum residual R (see class description).
+    void compute( const linalg::VectorQ1Vec< ScalarType >& residual )
+    {
+        compute_cbf_radial_stress(
+            sigma_rr_surface_, residual.grid_data(), mass_surface_, coords_shell_, boundary_mask_, true );
+        compute_cbf_radial_stress(
+            sigma_rr_cmb_, residual.grid_data(), mass_cmb_, coords_shell_, boundary_mask_, false );
+        Kokkos::fence();
+    }
+
+    const grid::Grid3DDataScalar< ScalarType >& sigma_rr_surface() const { return sigma_rr_surface_; }
+    const grid::Grid3DDataScalar< ScalarType >& sigma_rr_cmb() const { return sigma_rr_cmb_; }
+
+  private:
+    grid::Grid3DDataVec< ScalarType, 3 >                     coords_shell_;
+    grid::Grid4DDataScalar< grid::shell::ShellBoundaryFlag > boundary_mask_;
+
+    grid::Grid3DDataScalar< ScalarType > mass_surface_;
+    grid::Grid3DDataScalar< ScalarType > mass_cmb_;
+    grid::Grid3DDataScalar< ScalarType > sigma_rr_surface_;
+    grid::Grid3DDataScalar< ScalarType > sigma_rr_cmb_;
+};
 
 } // namespace terra::mantlecirculation

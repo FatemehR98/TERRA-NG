@@ -22,9 +22,9 @@
 #include <iostream>
 #include <set>
 #include <vector>
-
-// #include "core/mpi/BufferDataTypeExtensions.h"
-// #include "core/mpi/Gatherv.h"
+#include <map>
+#include <numeric>
+#include <string>
 
 #include "mpi/mpi.hpp"
 #include "terra/plates/utilities.hpp"
@@ -96,51 +96,54 @@ class StatisticsPlateNotFoundHandler
     }
 
   private:
-    void combineMaps( map_t& dstMap, const map_t& srcMap )
-    {
-        // loop over source map
-        for ( auto [key, srcSet] : srcMap )
-        {
-            // check for key in destination map
-            auto keyPos = dstMap.find( key );
-
-            // if key does not exist, simply insert new key, set pair
-            if ( keyPos == dstMap.end() )
-            {
-                dstMap[key] = srcSet;
-            }
-
-            // key exists, so merge the sets
-            else
-            {
-                auto& dstSet = keyPos->second;
-                dstSet.insert( srcSet.begin(), srcSet.end() );
-            }
-        }
-    }
-
+    /// Gather the maps of all processes on root and merge them (other ranks get an empty map).
+    ///
+    /// Each point is sent as a tuple ( age, x, y, z ) of doubles, so a single MPI_Gatherv suffices.
     map_t collectDataOnRoot()
     {
-        // walberla::mpi::SendBuffer sendBuffer;
-        // sendBuffer << pointsNotFound_;
-        // walberla::mpi::RecvBuffer recvBuffer;
-        // walberla::mpi::gathervBuffer( sendBuffer, recvBuffer );
-        std::cout << "BIG BIG BIG TROUBLE; WE'RE IN collectDataOnRoot \n\n";
-        std::abort();
-        const auto         myRank = mpi::rank();
-        const unsigned int nProcs = mpi::num_processes();
+        constexpr int tupleSize = 4;
 
-        map_t globalMap;
+        // flatten local map; parse the full age from the key, as keyStrToAge() truncates to 6 characters
+        std::vector< double > sendBuf;
+        for ( const auto& [key, points] : pointsNotFound_ )
+        {
+            const double age = std::stod( key.substr( 9 ) );
+            for ( const auto& p : points )
+            {
+                sendBuf.insert( sendBuf.end(), { age, p( 0 ), p( 1 ), p( 2 ) } );
+            }
+        }
 
-        // extract individual maps and combine them into a global one
+        const int myRank    = mpi::rank();
+        const int nProcs    = mpi::num_processes();
+        const int sendCount = static_cast< int >( sendBuf.size() );
+
+        std::vector< int > counts( myRank == 0 ? nProcs : 0 );
+        std::vector< int > displs( myRank == 0 ? nProcs : 0 );
+        MPI_Gather( &sendCount, 1, MPI_INT, counts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD );
+
+        std::vector< double > recvBuf;
         if ( myRank == 0 )
         {
-            map_t singleMap;
-            for ( uint_t k = 0; k < nProcs; ++k )
-            {
-                // recvBuffer >> singleMap;
-                combineMaps( globalMap, singleMap );
-            }
+            std::exclusive_scan( counts.begin(), counts.end(), displs.begin(), 0 );
+            recvBuf.resize( displs.back() + counts.back() );
+        }
+
+        MPI_Gatherv( sendBuf.data(),
+                     sendCount,
+                     mpi::mpi_datatype< double >(),
+                     recvBuf.data(),
+                     counts.data(),
+                     displs.data(),
+                     mpi::mpi_datatype< double >(),
+                     0,
+                     MPI_COMM_WORLD );
+
+        // rebuild the map; std::set takes care of merging duplicates across ranks
+        map_t globalMap;
+        for ( std::size_t i = 0; i < recvBuf.size(); i += tupleSize )
+        {
+            globalMap[ageToKeyStr( recvBuf[i] )].insert( vec3D{ recvBuf[i + 1], recvBuf[i + 2], recvBuf[i + 3] } );
         }
 
         return globalMap;

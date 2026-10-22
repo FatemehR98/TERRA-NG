@@ -24,9 +24,6 @@
 namespace terra {
 namespace plates {
 
-using plates::FiniteRotation;
-using plates::rotIter_t;
-
 /// Computes a matrix for rotation around a given axis vector by given angle
 inline mat3D xyzRotationMatrix( const vec3D& vector, double angle )
 {

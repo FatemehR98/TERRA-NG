@@ -102,6 +102,13 @@ inline AveragingStencil< typename Kokkos::DefaultExecutionSpace::memory_space >
     return { exec, provider.maxDistance( vec3D{ 0, 0, 1 } ) };
 }
 
+/// @brief Radius of the actual shell surface, cast exactly as \ref grid::shell::subdomain_shell_radii casts it.
+template < typename ScalarType >
+ScalarType surface_radius( const grid::shell::DistributedDomain& domain )
+{
+    return static_cast< ScalarType >( domain.domain_info().radii().back() );
+}
+
 /// @brief Writes the id of the plate under every node of the outermost shell.
 ///
 /// Uses the same packed-stage lookup as the velocity kernel, i.e. the arc-crossing test in
@@ -119,28 +126,29 @@ struct PlateIDInterpolator
     grid::Grid2DDataScalar< ScalarType > coords_radii;
     grid::Grid4DDataScalar< ScalarType > plate_id;
     PlateStageViews< ExecMemSpace >      stage;
+    ScalarType                           r_max;
     int                                  surface_r;
 
     KOKKOS_INLINE_FUNCTION
-    void operator()( const int sd, const int x, const int y, const int r ) const
+    void operator()( const int sd, const int x, const int y ) const
     {
-        if ( r != surface_r )
-        {
-            plate_id( sd, x, y, r ) = ScalarType( 0 );
+        if ( coords_radii( sd, surface_r ) != r_max )
             return;
-        }
 
-        const auto  coords    = grid::shell::coords( sd, x, y, r, coords_shell, coords_radii );
+        const auto  coords    = grid::shell::coords( sd, x, y, surface_r, coords_shell, coords_radii );
         const vec3D lonLatRad = conversions::cart2sph( vec3D{ coords( 0 ), coords( 1 ), coords( 2 ) } );
 
         const auto hit = findPlateInStage( stage, geometry::lonLatDegToUnit( lonLatRad( 0 ), lonLatRad( 1 ) ) );
 
-        plate_id( sd, x, y, r ) =
+        plate_id( sd, x, y, surface_r ) =
             hit.found ? static_cast< ScalarType >( stage.plateId( hit.plateIndex ) ) : ScalarType( 0 );
     }
 };
 
 /// @brief Fills `plate_id` with the plate under each outermost-shell node, on the device.
+///
+/// Only the outermost shell is written; every other node keeps whatever `plate_id` already holds (zero for a
+/// freshly constructed view).
 template < typename ScalarType >
 void extract_plate_ids(
     const grid::shell::DistributedDomain&                                          domain,
@@ -149,12 +157,15 @@ void extract_plate_ids(
     const PlateStageViews< typename Kokkos::DefaultExecutionSpace::memory_space >& stage,
     grid::Grid4DDataScalar< ScalarType >&                                          plate_id )
 {
-    const int surface_r = domain.domain_info().subdomain_num_nodes_radially() - 1;
+    const int  num_sub   = static_cast< int >( domain.subdomains().size() );
+    const int  n_lat     = domain.domain_info().subdomain_num_nodes_per_side_laterally();
+    const int  surface_r = domain.domain_info().subdomain_num_nodes_radially() - 1;
+    const auto r_max     = surface_radius< ScalarType >( domain );
 
     Kokkos::parallel_for(
         "extract_plate_ids",
-        grid::shell::local_domain_md_range_policy_nodes( domain ),
-        PlateIDInterpolator< ScalarType >{ coords_shell, coords_radii, plate_id, stage, surface_r } );
+        Kokkos::MDRangePolicy< Kokkos::Rank< 3 > >( { 0, 0, 0 }, { num_sub, n_lat, n_lat } ),
+        PlateIDInterpolator< ScalarType >{ coords_shell, coords_radii, plate_id, stage, r_max, surface_r } );
     Kokkos::fence();
 }
 
@@ -169,6 +180,7 @@ struct PlateVelocityInterpolator
     grid::Grid4DDataVec< ScalarType, 3 > velocity;
     PlateStageViews< ExecMemSpace >      stage;
     AveragingStencil< ExecMemSpace >     stencil;
+    ScalarType                           r_max;
     int                                  surface_r;
     ScalarType                           scale;
 
@@ -194,6 +206,9 @@ struct PlateVelocityInterpolator
     KOKKOS_INLINE_FUNCTION
     void operator()( const int sd, const int x, const int y ) const
     {
+        if ( coords_radii( sd, surface_r ) != r_max )
+            return;
+
         const auto  coords = grid::shell::coords( sd, x, y, surface_r, coords_shell, coords_radii );
         const vec3D point{ coords( 0 ), coords( 1 ), coords( 2 ) };
 
@@ -274,11 +289,15 @@ struct PlateVelocityInterpolatorInTime
     grid::Grid4DDataVec< ScalarType, 3 > velocity_floor;
     grid::Grid4DDataVec< ScalarType, 3 > velocity;
     ScalarType                           interpolation_factor;
+    ScalarType                           r_max;
     int                                  surface_r;
 
     KOKKOS_INLINE_FUNCTION
     void operator()( const int sd, const int x, const int y ) const
     {
+        if ( coords_radii( sd, surface_r ) != r_max )
+            return;
+
         for ( int d = 0; d < 3; ++d )
             velocity( sd, x, y, surface_r, d ) = velocity_floor( sd, x, y, surface_r, d ) +
                                                  interpolation_factor * ( velocity_ceil( sd, x, y, surface_r, d ) -
@@ -300,15 +319,16 @@ void extract_plate_velocities(
     grid::Grid4DDataVec< ScalarType, 3 >&                                           velocity,
     const ScalarType                                                                scale )
 {
-    const int num_sub   = static_cast< int >( domain.subdomains().size() );
-    const int n_lat     = domain.domain_info().subdomain_num_nodes_per_side_laterally();
-    const int surface_r = domain.domain_info().subdomain_num_nodes_radially() - 1;
+    const int  num_sub   = static_cast< int >( domain.subdomains().size() );
+    const int  n_lat     = domain.domain_info().subdomain_num_nodes_per_side_laterally();
+    const int  surface_r = domain.domain_info().subdomain_num_nodes_radially() - 1;
+    const auto r_max     = surface_radius< ScalarType >( domain );
 
     Kokkos::parallel_for(
         "extract_plate_velocities",
         Kokkos::MDRangePolicy< Kokkos::Rank< 3 > >( { 0, 0, 0 }, { num_sub, n_lat, n_lat } ),
         PlateVelocityInterpolator< ScalarType >{
-            coords_shell, coords_radii, velocity, stage, stencil, surface_r, scale } );
+            coords_shell, coords_radii, velocity, stage, stencil, r_max, surface_r, scale } );
     Kokkos::fence();
 }
 
@@ -325,43 +345,51 @@ void extract_plate_velocities_interpolated_in_time(
     const ScalarType                                                                scale,
     const ScalarType                                                                interpolation_factor )
 {
-    const int num_sub   = static_cast< int >( domain.subdomains().size() );
-    const int n_lat     = domain.domain_info().subdomain_num_nodes_per_side_laterally();
-    const int surface_r = domain.domain_info().subdomain_num_nodes_radially() - 1;
+    const int  num_sub   = static_cast< int >( domain.subdomains().size() );
+    const int  n_lat     = domain.domain_info().subdomain_num_nodes_per_side_laterally();
+    const int  surface_r = domain.domain_info().subdomain_num_nodes_radially() - 1;
+    const auto r_max     = surface_radius< ScalarType >( domain );
 
     grid::Grid4DDataVec< ScalarType, 3 > velocity_ceil(
         "velocity_ceil",
         domain.subdomains().size(),
         domain.domain_info().subdomain_num_nodes_per_side_laterally(),
         domain.domain_info().subdomain_num_nodes_per_side_laterally(),
-        surface_r );
+        surface_r + 1 );
 
     grid::Grid4DDataVec< ScalarType, 3 > velocity_floor(
         "velocity_floor",
         domain.subdomains().size(),
         domain.domain_info().subdomain_num_nodes_per_side_laterally(),
         domain.domain_info().subdomain_num_nodes_per_side_laterally(),
-        surface_r );
+        surface_r + 1 );
 
     Kokkos::parallel_for(
         "extract_plate_velocities",
         Kokkos::MDRangePolicy< Kokkos::Rank< 3 > >( { 0, 0, 0 }, { num_sub, n_lat, n_lat } ),
         PlateVelocityInterpolator< ScalarType >{
-            coords_shell, coords_radii, velocity_ceil, stage_ceil, stencil, surface_r, scale } );
+            coords_shell, coords_radii, velocity_ceil, stage_ceil, stencil, r_max, surface_r, scale } );
     Kokkos::fence();
 
     Kokkos::parallel_for(
         "extract_plate_velocities",
         Kokkos::MDRangePolicy< Kokkos::Rank< 3 > >( { 0, 0, 0 }, { num_sub, n_lat, n_lat } ),
         PlateVelocityInterpolator< ScalarType >{
-            coords_shell, coords_radii, velocity_floor, stage_floor, stencil, surface_r, scale } );
+            coords_shell, coords_radii, velocity_ceil, stage_ceil, stencil, r_max, surface_r, scale } );
     Kokkos::fence();
 
     Kokkos::parallel_for(
         "extract_plate_velocities",
         Kokkos::MDRangePolicy< Kokkos::Rank< 3 > >( { 0, 0, 0 }, { num_sub, n_lat, n_lat } ),
         PlateVelocityInterpolatorInTime< ScalarType >{
-            coords_shell, coords_radii, velocity_ceil, velocity_floor, velocity, interpolation_factor, surface_r } );
+            coords_shell,
+            coords_radii,
+            velocity_ceil,
+            velocity_floor,
+            velocity,
+            interpolation_factor,
+            r_max,
+            surface_r } );
     Kokkos::fence();
 }
 
@@ -378,9 +406,10 @@ long long surface_points_needing_averaging(
     const PlateStageViews< typename Kokkos::DefaultExecutionSpace::memory_space >& stage,
     const double                                                                   max_distance_km )
 {
-    const int num_sub   = static_cast< int >( domain.subdomains().size() );
-    const int n_lat     = domain.domain_info().subdomain_num_nodes_per_side_laterally();
-    const int surface_r = domain.domain_info().subdomain_num_nodes_radially() - 1;
+    const int  num_sub   = static_cast< int >( domain.subdomains().size() );
+    const int  n_lat     = domain.domain_info().subdomain_num_nodes_per_side_laterally();
+    const int  surface_r = domain.domain_info().subdomain_num_nodes_radially() - 1;
+    const auto r_max     = surface_radius< ScalarType >( domain );
 
     long long count = 0;
 
@@ -388,6 +417,9 @@ long long surface_points_needing_averaging(
         "surface_points_needing_averaging",
         Kokkos::MDRangePolicy< Kokkos::Rank< 3 > >( { 0, 0, 0 }, { num_sub, n_lat, n_lat } ),
         KOKKOS_LAMBDA( const int sd, const int x, const int y, long long& acc ) {
+            if ( coords_radii( sd, surface_r ) != r_max )
+                return;
+
             const auto  coords    = grid::shell::coords( sd, x, y, surface_r, coords_shell, coords_radii );
             const vec3D lonLatRad = conversions::cart2sph( vec3D{ coords( 0 ), coords( 1 ), coords( 2 ) } );
             const auto  unit      = geometry::lonLatDegToUnit( lonLatRad( 0 ), lonLatRad( 1 ) );

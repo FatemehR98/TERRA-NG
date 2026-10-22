@@ -35,20 +35,10 @@ void extract_plate_velocities(
     const plates::UniformCirclesPointWeightProvider weights( { { 1.0 / 100.0, 6 } }, 1e-1 );
     const auto                                      stencil = plates::make_averaging_stencil( weights );
 
-    ScalarType plate_age_ceil;
-    ScalarType plate_age_floor;
-    ScalarType interpolation_factor;
-
     const ScalarType remainder = std::ceil( plate_age ) - plate_age;
 
     if ( !interpolate_in_time )
         plate_age = std::ceil( plate_age );
-    else
-    {
-        plate_age_ceil       = std::ceil( plate_age );
-        plate_age_floor      = std::ceil( plate_age ) - 1;
-        interpolation_factor = ( plate_age - plate_age_floor ) / ( plate_age_ceil - plate_age_floor );
-    }
 
     util::logroot << "Updating plates..... Plate age: " << plate_age << " Ma." << std::endl;
 
@@ -75,6 +65,10 @@ void extract_plate_velocities(
     }
     else
     {
+        const ScalarType plate_age_ceil       = std::ceil( plate_age );
+        const ScalarType plate_age_floor      = std::floor( plate_age );
+        const ScalarType interpolation_factor = plate_age - plate_age_floor;
+
         plates::extract_plate_velocities_interpolated_in_time< ScalarType >(
             domain,
             coords_shell,

@@ -36,6 +36,8 @@
 
 namespace terra::plates {
 
+using ExecMemSpace = Kokkos::DefaultExecutionSpace::memory_space;
+
 /// @brief An orthonormal pair spanning the tangent plane at `normalCart`.
 ///
 /// Device-callable counterpart of \ref findOrthogonalVectorsCart, which returns a std::pair and uses std::fabs.
@@ -81,11 +83,8 @@ struct AveragingStencil
 };
 
 /// @brief Uploads a UniformCirclesPointWeightProvider's stencil once, for reuse across all points.
-inline AveragingStencil< typename Kokkos::DefaultExecutionSpace::memory_space >
-    make_averaging_stencil( const UniformCirclesPointWeightProvider& provider )
+inline AveragingStencil< ExecMemSpace > make_averaging_stencil( const UniformCirclesPointWeightProvider& provider )
 {
-    using ExecMemSpace = typename Kokkos::DefaultExecutionSpace::memory_space;
-
     const auto& offsets = provider.sampleOffsets2DCart();
 
     Kokkos::View< double* [3], Kokkos::LayoutRight, ExecMemSpace > exec( "plate_averaging_stencil", offsets.size() );
@@ -113,8 +112,6 @@ inline AveragingStencil< typename Kokkos::DefaultExecutionSpace::memory_space >
 template < typename ScalarType >
 struct PlateIDInterpolator
 {
-    using ExecMemSpace = Kokkos::DefaultExecutionSpace::memory_space;
-
     grid::Grid3DDataVec< ScalarType, 3 > coords_shell;
     grid::Grid2DDataScalar< ScalarType > coords_radii;
     grid::Grid4DDataScalar< ScalarType > plate_id;
@@ -144,11 +141,11 @@ struct PlateIDInterpolator
 /// freshly constructed view).
 template < typename ScalarType >
 void extract_plate_ids(
-    const grid::shell::DistributedDomain&                                          domain,
-    const grid::Grid3DDataVec< ScalarType, 3 >&                                    coords_shell,
-    const grid::Grid2DDataScalar< ScalarType >&                                    coords_radii,
-    const PlateStageViews< typename Kokkos::DefaultExecutionSpace::memory_space >& stage,
-    grid::Grid4DDataScalar< ScalarType >&                                          plate_id )
+    const grid::shell::DistributedDomain&       domain,
+    const grid::Grid3DDataVec< ScalarType, 3 >& coords_shell,
+    const grid::Grid2DDataScalar< ScalarType >& coords_radii,
+    const PlateStageViews< ExecMemSpace >&      stage,
+    grid::Grid4DDataScalar< ScalarType >&       plate_id )
 {
     const int        num_sub        = static_cast< int >( domain.subdomains().size() );
     const int        n_lat          = domain.domain_info().subdomain_num_nodes_per_side_laterally();
@@ -170,8 +167,6 @@ void extract_plate_ids(
 template < typename ScalarType >
 struct PlateVelocityInterpolator
 {
-    using ExecMemSpace = Kokkos::DefaultExecutionSpace::memory_space;
-
     grid::Grid3DDataVec< ScalarType, 3 > coords_shell;
     grid::Grid2DDataScalar< ScalarType > coords_radii;
     grid::Grid4DDataVec< ScalarType, 3 > velocity;
@@ -305,15 +300,15 @@ struct PlateVelocityInterpolator
 /// `Floor_weight` is the weight of stage_floor (ceil( plate_age ) - plate_age for an age between the stages.
 template < typename ScalarType >
 void extract_plate_velocities(
-    const grid::shell::DistributedDomain&                                           domain,
-    const grid::Grid3DDataVec< ScalarType, 3 >&                                     coords_shell,
-    const grid::Grid2DDataScalar< ScalarType >&                                     coords_radii,
-    const PlateStageViews< typename Kokkos::DefaultExecutionSpace::memory_space >&  stage_ceil,
-    const PlateStageViews< typename Kokkos::DefaultExecutionSpace::memory_space >&  stage_floor,
-    const AveragingStencil< typename Kokkos::DefaultExecutionSpace::memory_space >& stencil,
-    grid::Grid4DDataVec< ScalarType, 3 >&                                           velocity,
-    const ScalarType                                                                floor_weight,
-    const ScalarType                                                                scale )
+    const grid::shell::DistributedDomain&       domain,
+    const grid::Grid3DDataVec< ScalarType, 3 >& coords_shell,
+    const grid::Grid2DDataScalar< ScalarType >& coords_radii,
+    const PlateStageViews< ExecMemSpace >&      stage_ceil,
+    const PlateStageViews< ExecMemSpace >&      stage_floor,
+    const AveragingStencil< ExecMemSpace >&     stencil,
+    grid::Grid4DDataVec< ScalarType, 3 >&       velocity,
+    const ScalarType                            floor_weight,
+    const ScalarType                            scale )
 {
     const int        num_sub        = static_cast< int >( domain.subdomains().size() );
     const int        n_lat          = domain.domain_info().subdomain_num_nodes_per_side_laterally();
@@ -340,13 +335,13 @@ void extract_plate_velocities(
 /// @brief Single-stage overload: plate velocities for one prepared stage, without time interpolation.
 template < typename ScalarType >
 void extract_plate_velocities(
-    const grid::shell::DistributedDomain&                                           domain,
-    const grid::Grid3DDataVec< ScalarType, 3 >&                                     coords_shell,
-    const grid::Grid2DDataScalar< ScalarType >&                                     coords_radii,
-    const PlateStageViews< typename Kokkos::DefaultExecutionSpace::memory_space >&  stage,
-    const AveragingStencil< typename Kokkos::DefaultExecutionSpace::memory_space >& stencil,
-    grid::Grid4DDataVec< ScalarType, 3 >&                                           velocity,
-    const ScalarType                                                                scale )
+    const grid::shell::DistributedDomain&       domain,
+    const grid::Grid3DDataVec< ScalarType, 3 >& coords_shell,
+    const grid::Grid2DDataScalar< ScalarType >& coords_radii,
+    const PlateStageViews< ExecMemSpace >&      stage,
+    const AveragingStencil< ExecMemSpace >&     stencil,
+    grid::Grid4DDataVec< ScalarType, 3 >&       velocity,
+    const ScalarType                            scale )
 {
     extract_plate_velocities< ScalarType >(
         domain, coords_shell, coords_radii, stage, stage, stencil, velocity, ScalarType( 0 ), scale );
@@ -359,11 +354,11 @@ void extract_plate_velocities(
 /// `max_distance_km` is the stencil reach, in the same units as the lookup distance.
 template < typename ScalarType >
 long long surface_points_needing_averaging(
-    const grid::shell::DistributedDomain&                                          domain,
-    const grid::Grid3DDataVec< ScalarType, 3 >&                                    coords_shell,
-    const grid::Grid2DDataScalar< ScalarType >&                                    coords_radii,
-    const PlateStageViews< typename Kokkos::DefaultExecutionSpace::memory_space >& stage,
-    const double                                                                   max_distance_km )
+    const grid::shell::DistributedDomain&       domain,
+    const grid::Grid3DDataVec< ScalarType, 3 >& coords_shell,
+    const grid::Grid2DDataScalar< ScalarType >& coords_radii,
+    const PlateStageViews< ExecMemSpace >&      stage,
+    const double                                max_distance_km )
 {
     const int        num_sub        = static_cast< int >( domain.subdomains().size() );
     const int        n_lat          = domain.domain_info().subdomain_num_nodes_per_side_laterally();

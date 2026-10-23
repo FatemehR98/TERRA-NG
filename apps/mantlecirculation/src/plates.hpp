@@ -65,21 +65,24 @@ void extract_plate_velocities(
     }
     else
     {
-        const ScalarType plate_age_ceil       = std::ceil( plate_age );
-        const ScalarType plate_age_floor      = std::floor( plate_age );
-        const ScalarType interpolation_factor = plate_age - plate_age_floor;
+        const ScalarType plate_age_ceil  = std::ceil( plate_age );
+        const ScalarType plate_age_floor = std::floor( plate_age );
 
-        plates::extract_plate_velocities_interpolated_in_time< ScalarType >(
+        // Interpolation factor is weight of the floor stage
+        // ( plate_age_ceil - plate_age ) / ( plate_age_ceil - plate_age_floor )
+        // With plate data defined every 1 Ma, denominator is 1 by construction.
+        const ScalarType interpolation_factor = plate_age_ceil - plate_age;
+
+        plates::extract_plate_velocities< ScalarType >(
             domain,
             coords_shell,
             coords_radii,
-            plate_age,
             oracle.stageFor( plate_age_ceil ).data(),
             oracle.stageFor( plate_age_floor ).data(),
             stencil,
             plate_velocities,
-            scale_factor,
-            interpolation_factor );
+            interpolation_factor,
+            scale_factor );
 
         util::logroot << "Plate data extracted (interpolated in time)." << std::endl;
         return;

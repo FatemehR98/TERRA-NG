@@ -90,8 +90,6 @@ void compare_at_level( plates::PlateVelocityProvider& oracle, const int level, c
     // The stencil the mantle circulation app uses: centre plus one ring of six at 1/100 rad, sigma 0.1.
     const plates::UniformCirclesPointWeightProvider stencil_host( { { 1.0 / 100.0, 6 } }, 1e-1 );
 
-    oracle.prepareEulerVectors( age );
-
     // ---- host path: the same call extract_plate_velocities() makes -----------------------------------------
     grid::Grid4DDataVec< ScalarType, 3 > host_v( "host_v", num_sub, n_lat, n_lat, n_rad );
     {
@@ -129,7 +127,7 @@ void compare_at_level( plates::PlateVelocityProvider& oracle, const int level, c
     const auto  stencil_device = plates::make_averaging_stencil( stencil_host );
 
     plates::extract_plate_velocities< ScalarType >(
-        domain, coords, radii_grid, stage.data(), stencil_device, device_v, ScalarType( 1 ) );
+        age, device_v, oracle, coords, radii_grid, ScalarType( 1 ), domain, stencil_device );
 
     // ---- compare, split by regime -------------------------------------------------------------------------
     const auto stage_views = stage.data();
@@ -222,7 +220,6 @@ void compare_at_level( plates::PlateVelocityProvider& oracle, const int level, c
 
         const auto& offsets = stencil_host.sampleOffsets2DCart();
         const int   r       = n_rad - 1;
-        int         printed = 0;
 
         struct Bad
         {

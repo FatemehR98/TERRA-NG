@@ -35,58 +35,19 @@ void extract_plate_velocities(
     const plates::UniformCirclesPointWeightProvider weights( { { 1.0 / 100.0, 6 } }, 1e-1 );
     const auto                                      stencil = plates::make_averaging_stencil( weights );
 
-    const ScalarType remainder = std::ceil( plate_age ) - plate_age;
-
+    // Set plate_age to the ceiling integer value if no interpolation in time
+    // is wanted. Holds only as long as plate data is defined in 1 Ma steps.
+    // Everything else regarding time-averaging is handled inside the plates
+    // module.
     if ( !interpolate_in_time )
         plate_age = std::ceil( plate_age );
 
     util::logroot << "Updating plates..... Plate age: " << plate_age << " Ma." << std::endl;
 
-    // Hoist the reconstruction-tree walk out of the per-point loop below. Without this every
-    // sample point re-derives the stage pole of its plate, which dominates the extraction cost.
-    if ( interpolate_in_time )
-        oracle.prepareEulerVectorsInterpolatedInTime( plate_age );
-    else
-        oracle.prepareEulerVectors( plate_age );
+    plates::extract_plate_velocities< ScalarType >(
+        plate_age, plate_velocities, oracle, coords_shell, coords_radii, scale_factor, domain, stencil );
 
-    if ( !interpolate_in_time || remainder == 0 )
-    {
-        plates::extract_plate_velocities< ScalarType >(
-            domain,
-            coords_shell,
-            coords_radii,
-            oracle.stageFor( plate_age ).data(),
-            stencil,
-            plate_velocities,
-            scale_factor );
-
-        util::logroot << "Plate data extracted." << std::endl;
-        return;
-    }
-    else
-    {
-        const ScalarType plate_age_ceil  = std::ceil( plate_age );
-        const ScalarType plate_age_floor = std::floor( plate_age );
-
-        // Interpolation factor is weight of the floor stage
-        // ( plate_age_ceil - plate_age ) / ( plate_age_ceil - plate_age_floor )
-        // With plate data defined every 1 Ma, denominator is 1 by construction.
-        const ScalarType interpolation_factor = plate_age_ceil - plate_age;
-
-        plates::extract_plate_velocities< ScalarType >(
-            domain,
-            coords_shell,
-            coords_radii,
-            oracle.stageFor( plate_age_ceil ).data(),
-            oracle.stageFor( plate_age_floor ).data(),
-            stencil,
-            plate_velocities,
-            interpolation_factor,
-            scale_factor );
-
-        util::logroot << "Plate data extracted (interpolated in time)." << std::endl;
-        return;
-    }
+    util::logroot << "Plate data extracted." << std::endl;
 }
 
 inline std::shared_ptr< plates::PlateVelocityProvider >

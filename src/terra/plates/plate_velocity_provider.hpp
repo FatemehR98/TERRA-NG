@@ -18,7 +18,9 @@
 
 #pragma once
 
+#include <algorithm>
 #include <set>
+#include <stdexcept>
 
 #include "terra/plates/conversions.hpp"
 #include "terra/plates/plate_not_found_handlers.hpp"
@@ -155,36 +157,50 @@ class PlateVelocityProvider
     /// Crop to plateStages if age lies outside.
     ///
     /// Returns a double tuple s.t. tuple[0] <= age <= tuple[1].
-    /// tuple[2] is a linear interpolation factor s.t. age = (1-tuple[2])*tuple[0] + tuple[2]*tuple[1]
-    std::tuple< double, double, double > getSurroundingAges( const double age )
+    /// tuple[2] is the linear weight of the floor age, s.t. age = tuple[2]*tuple[0] + (1-tuple[2])*tuple[1]
+    /// tuple[3] is the weight of the ceil age, s.t. age = (1-tuple[3])*tuple[0] + tuple[3]*tuple[1]
+    std::tuple< double, double, double, double > getSurroundingAges( const double age )
     {
         std::vector< double > plateStages = plateTopologies_.getListOfPlateStages();
+
+        if ( plateStages.empty() )
+            throw std::runtime_error( "Surrounding plate ages cannot be found" );
+
+        if ( !std::is_sorted( plateStages.begin(), plateStages.end() ) )
+            throw std::runtime_error( "Plate stages must be sorted in ascending order" );
+
         // find the age in the plateStages list, crop to plateStages if age lies outside
         uint_t indexFloor;
         uint_t indexCeil;
-        double interpolationFactor;
+        double weightFloor;
+        double weightCeil;
+
         if ( age >= plateStages.back() )
         {
-            indexFloor          = plateStages.size() - 1;
-            indexCeil           = indexFloor;
-            interpolationFactor = static_cast< double >( 1.0 );
+            indexFloor  = plateStages.size() - 1;
+            indexCeil   = indexFloor;
+            weightFloor = 1.0;
+            weightCeil  = 0.0;
         }
         else if ( age <= plateStages.front() )
         {
-            indexFloor          = 0;
-            indexCeil           = 0;
-            interpolationFactor = static_cast< double >( 1.0 );
+            indexFloor  = 0;
+            indexCeil   = 0;
+            weightFloor = 1.0;
+            weightCeil  = 0.0;
         }
         else
         {
             auto iteratorLowerBound = std::lower_bound( plateStages.begin(), plateStages.end(), age );
             indexCeil               = static_cast< uint_t >( std::distance( plateStages.begin(), iteratorLowerBound ) );
             indexFloor              = indexCeil - 1;
-            interpolationFactor =
-                ( age - plateStages.at( indexFloor ) ) / ( plateStages.at( indexCeil ) - plateStages.at( indexFloor ) );
+            weightFloor =
+                ( plateStages.at( indexCeil ) - age ) / ( plateStages.at( indexCeil ) - plateStages.at( indexFloor ) );
+            //weightCeil              = ( age - plateStages.at( indexFloor ) ) / ( plateStages.at( indexCeil ) - plateStages.at( indexFloor ) );
+            weightCeil = 1.0 - weightFloor;
         }
 
-        return { plateStages.at( indexFloor ), plateStages.at( indexCeil ), interpolationFactor };
+        return { plateStages.at( indexFloor ), plateStages.at( indexCeil ), weightFloor, weightCeil };
     }
 
     /// Returns velocity vector for a point determined from the velocity of the associated plate at given age stage
@@ -201,17 +217,14 @@ class PlateVelocityProvider
         PlateNotFoundStrategy&& errorHandler )
     {
         // find surrounding plate ages and interpolation factor
-        double ageFloor;
-        double ageCeil;
-        double interpolationFactor;
-        std::tie( ageFloor, ageCeil, interpolationFactor ) = getSurroundingAges( age );
+        [[maybe_unused]] const auto [ageFloor, ageCeil, weightFloor, weightCeil] = getSurroundingAges( age );
 
         // call getPointVelocity twice
         vec3D vecFloor = getPointVelocity( point, ageFloor, computeSmoothing, errorHandler );
         vec3D vecCeil  = getPointVelocity( point, ageCeil, computeSmoothing, errorHandler );
 
         // linear interpolation in time
-        return vecFloor + interpolationFactor * ( vecCeil - vecFloor );
+        return vecFloor + weightCeil * ( vecCeil - vecFloor );
     }
 
     /// Computes a weighted average of the velocity around the given point using the provided point and weights.
@@ -307,17 +320,14 @@ class PlateVelocityProvider
         PlateNotFoundStrategy&&                  errorHandler )
     {
         // find surrounding plate ages and interpolation factor
-        double ageFloor;
-        double ageCeil;
-        double interpolationFactor;
-        std::tie( ageFloor, ageCeil, interpolationFactor ) = getSurroundingAges( age );
+        [[maybe_unused]] const auto [ageFloor, ageCeil, weightFloor, weightCeil] = getSurroundingAges( age );
 
         // call getLocallyAveragedPointVelocity twice
         vec3D vecFloor = getLocallyAveragedPointVelocity( point, ageFloor, pointWeightProvider, errorHandler );
         vec3D vecCeil  = getLocallyAveragedPointVelocity( point, ageCeil, pointWeightProvider, errorHandler );
 
         // linear interpolation in time
-        return vecFloor + interpolationFactor * ( vecCeil - vecFloor );
+        return vecFloor + weightCeil * ( vecCeil - vecFloor );
     }
 
     /// Query function to obtain a vector of plate stages available in the datafiles
@@ -382,14 +392,6 @@ class PlateVelocityProvider
                 }
             }
         }
-    }
-
-    /// Same, for both stages bracketing \p age, as used by the *InterpolatedInTime queries
-    void prepareEulerVectorsInterpolatedInTime( const double age )
-    {
-        const auto [ageFloor, ageCeil, interpolationFactor] = getSurroundingAges( age );
-        prepareEulerVectors( ageFloor );
-        prepareEulerVectors( ageCeil );
     }
 
     /// Plates that the topologies name but the rotation data does not describe, as found by the most recent

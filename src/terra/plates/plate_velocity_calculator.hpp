@@ -6,6 +6,7 @@
 #include "terra/plates/conversions.hpp"
 #include "terra/plates/plate_rotation_provider.hpp"
 #include "terra/plates/plate_stage_data.hpp"
+#include "terra/plates/plate_velocity_provider.hpp"
 #include "terra/plates/spherical_predicates.hpp"
 #include "terra/plates/types.hpp"
 
@@ -300,16 +301,36 @@ struct PlateVelocityInterpolator
 /// `Floor_weight` is the weight of stage_floor (ceil( plate_age ) - plate_age for an age between the stages.
 template < typename ScalarType >
 void extract_plate_velocities(
-    const grid::shell::DistributedDomain&       domain,
+    ScalarType                                  plate_age,
+    grid::Grid4DDataVec< ScalarType, 3 >&       plate_velocities,
+    PlateVelocityProvider&                      oracle,
     const grid::Grid3DDataVec< ScalarType, 3 >& coords_shell,
     const grid::Grid2DDataScalar< ScalarType >& coords_radii,
-    const PlateStageViews< ExecMemSpace >&      stage_ceil,
-    const PlateStageViews< ExecMemSpace >&      stage_floor,
-    const AveragingStencil< ExecMemSpace >&     stencil,
-    grid::Grid4DDataVec< ScalarType, 3 >&       velocity,
-    const ScalarType                            floor_weight,
-    const ScalarType                            scale )
+    const ScalarType                            scale_factor,
+    const grid::shell::DistributedDomain&       domain,
+    const AveragingStencil< ExecMemSpace >&     stencil )
 {
+    // The bracketing ages come from the provider, nothing here assumes the spacing of the stages.
+    // [[maybe_unused]] because we only need floor_weight, not ceil_weight.
+    [[maybe_unused]] const auto [age_floor, age_ceil, floor_weight, ceil_weight] =
+        oracle.getSurroundingAges( plate_age );
+
+    // Ages within `tol` (in fractions of the inverval) of a stage collapse onto it:
+    // no blending, no second stage gets build for an age that is on a stage up to rounding.
+    constexpr double tol      = 1e-9;
+    const bool       on_floor = floor_weight > 1.0 - tol;
+    const bool       blend    = floor_weight >= tol && !on_floor;
+
+    // Hoist the reconstruction-tree walk out of the per-point loop. Stages that already exist in the provider
+    // are reused, so this is only expensive when the age crosses into a new stage interval.
+    oracle.prepareEulerVectors( age_ceil );
+    if ( blend )
+        oracle.prepareEulerVectors( age_floor );
+
+    // Copy the stages before anything can evict them from the provider
+    const auto stage_ceil  = oracle.stageFor( age_ceil ).data();
+    const auto stage_floor = blend ? oracle.stageFor( age_floor ).data() : stage_ceil;
+
     const int        num_sub        = static_cast< int >( domain.subdomains().size() );
     const int        n_lat          = domain.domain_info().subdomain_num_nodes_per_side_laterally();
     const int        surface_idx    = domain.domain_info().subdomain_num_nodes_radially() - 1;
@@ -321,30 +342,15 @@ void extract_plate_velocities(
         PlateVelocityInterpolator< ScalarType >{
             coords_shell,
             coords_radii,
-            velocity,
+            plate_velocities,
             stage_ceil,
             stage_floor,
             stencil,
             surface_radius,
             surface_idx,
             floor_weight,
-            scale } );
+            scale_factor } );
     Kokkos::fence();
-}
-
-/// @brief Single-stage overload: plate velocities for one prepared stage, without time interpolation.
-template < typename ScalarType >
-void extract_plate_velocities(
-    const grid::shell::DistributedDomain&       domain,
-    const grid::Grid3DDataVec< ScalarType, 3 >& coords_shell,
-    const grid::Grid2DDataScalar< ScalarType >& coords_radii,
-    const PlateStageViews< ExecMemSpace >&      stage,
-    const AveragingStencil< ExecMemSpace >&     stencil,
-    grid::Grid4DDataVec< ScalarType, 3 >&       velocity,
-    const ScalarType                            scale )
-{
-    extract_plate_velocities< ScalarType >(
-        domain, coords_shell, coords_radii, stage, stage, stencil, velocity, ScalarType( 0 ), scale );
 }
 
 /// @brief Counts surface nodes close enough to a plate boundary that the host path would average over its

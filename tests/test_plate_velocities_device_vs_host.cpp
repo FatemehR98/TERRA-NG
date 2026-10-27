@@ -93,6 +93,9 @@ void compare_at_level( plates::PlateVelocityProvider& oracle, const int level, c
     // ---- host path: the same call extract_plate_velocities() makes -----------------------------------------
     grid::Grid4DDataVec< ScalarType, 3 > host_v( "host_v", num_sub, n_lat, n_lat, n_rad );
     {
+        // prepareEulerVectors for the host functions
+        oracle.prepareEulerVectors( age );
+
         // create_mirror_view (not ..._and_copy) so the types are exactly the host_mirror_type that
         // grid::shell::coords() static_asserts on.
         auto coords_h = Kokkos::create_mirror_view( coords );

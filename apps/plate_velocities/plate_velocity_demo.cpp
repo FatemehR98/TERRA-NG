@@ -27,8 +27,8 @@
 #include "src/parameters.hpp"
 #include "terra/io/xdmf.hpp"
 #include "terra/kokkos/kokkos_wrapper.hpp"
-#include "terra/plates/plate_velocity_provider.hpp"
 #include "terra/plates/plate_velocity_calculator.hpp"
+#include "terra/plates/plate_velocity_provider.hpp"
 #include "terra/plates/types.hpp"
 #include "util/init.hpp"
 #include "util/logging.hpp"
@@ -62,7 +62,7 @@ typedef enum
 using uint_t = unsigned int;
 
 template < typename GridType, typename RadiiType, typename DataType >
-struct PlateIDInterpolator
+struct PlateIDInterpolatorDemo
 {
     GridType  grid_;
     RadiiType radii_;
@@ -70,7 +70,7 @@ struct PlateIDInterpolator
 
     std::function< double( const vec3D& ) > findPlateID;
 
-    PlateIDInterpolator(
+    PlateIDInterpolatorDemo(
         const GridType&                         grid,
         const RadiiType&                        radii,
         const DataType&                         data,
@@ -180,7 +180,7 @@ void performComputations(
         "Plate ID interpolation",
         Kokkos::MDRangePolicy< HostExecSpace, Kokkos::Rank< 3 > >(
             { 0, 0, 0 }, { coords_shell.extent( 0 ), coords_shell.extent( 1 ), coords_shell.extent( 2 ) } ),
-        PlateIDInterpolator( coords_shell, coords_radii, ( plateID_host ), findPlateID ) );
+        PlateIDInterpolatorDemo( coords_shell, coords_radii, ( plateID_host ), findPlateID ) );
 
     Kokkos::fence();
 
@@ -188,7 +188,8 @@ void performComputations(
         "Plate Velocity interpolation",
         Kokkos::MDRangePolicy< HostExecSpace, Kokkos::Rank< 3 > >(
             { 0, 0, 0 }, { coords_shell.extent( 0 ), coords_shell.extent( 1 ), coords_shell.extent( 2 ) } ),
-        PlateVelocityInterpolatorDemo( coords_shell, coords_radii, ( surfaceVelocity_host ), computeVelocityComponent ) );
+        PlateVelocityInterpolatorDemo(
+            coords_shell, coords_radii, ( surfaceVelocity_host ), computeVelocityComponent ) );
 
     Kokkos::fence();
 
@@ -314,9 +315,9 @@ int main( int argc, char** argv )
     logroot << "*** STEP 3: Generating an Oracle" << std::endl;
 
     //std::string dataDir{ "/import/freenas-m-04-students/frezaei/TerraNeoX/TERRA-NG/apps/plate_velocities/data/plates/" };
-    const std::string& dataDir = parameters.dataDir;
-    std::string fnameTopologies      = dataDir + "topologies_0-410Ma.geojson";
-    std::string fnameReconstructions = dataDir + "TomoPAC2.rot";
+    const std::string&                   dataDir              = parameters.dataDir;
+    std::string                          fnameTopologies      = dataDir + "topologies_0-410Ma.geojson";
+    std::string                          fnameReconstructions = dataDir + "TomoPAC2.rot";
     terra::plates::PlateVelocityProvider oracle( fnameTopologies, fnameReconstructions );
 
     logroot << "*** STEP 4: Checking plate stages to work with" << std::endl;

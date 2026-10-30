@@ -52,9 +52,13 @@ struct MeshParameters
 
 struct PlateParameters
 {
-    bool apply_plate_velocities = false; // This does nothing yet
-    int  initial_plate_age      = 400;
-    int  final_plate_age        = 0;
+    bool apply_plate_velocities     = false;
+    bool interpolate_plates_in_time = true;
+    int  initial_plate_age          = 400;
+    int  final_plate_age            = 0;
+
+    std::string plates_topologies_path = "../../../TERRA-NG/data/plates/Chen2025-tomopac/topologies_0-410Ma.geojson";
+    std::string plates_reconstructions_path = "../../../TERRA-NG/data/plates/Chen2025-tomopac/TomoPAC2.rot";
 
     double plate_velocity_scaling = 1.0;
 };
@@ -152,7 +156,7 @@ struct InitialTemperatureParameters
     InitialPerturbation       perturbation = InitialPerturbation::SPHERICAL_HARMONICS;
 
     // Reference temperature from file
-    std::string Tref_profile_csv_path  = "TemperatureProfile_3800K.csv";
+    std::string Tref_profile_csv_path  = "../../../TERRA-NG/data/radialprofiles/TemperatureProfile_3800K.csv";
     std::string Tref_profile_value_key = "Temperature (K)";
 
     double perturbation_amplitude = 5e-2;
@@ -212,7 +216,7 @@ struct PhysicsParameters
     double calc_cm_per_year = 3e-4; // from non-dim velocity to cm/a
     double calc_time_Ma     = 1e6;  // from non-dim time to Ma
 
-    // Parameter radial profiles -- to be done
+    // Parameter radial profiles
     std::string density_profile_csv_path = "";
     std::string alpha_profile_csv_path   = "";
     std::string cp_profile_csv_path      = "";
@@ -285,7 +289,7 @@ struct StokesSolverParameters
 };
 
 /// Time-discretization scheme for the energy (temperature) equation.
-///   SUPG : implicit SUPG-stabilised Galerkin advection-diffusion on the Q1 mesh,
+///   SUPG : implicit SUPG-stabilised Galerkin advection-diffusion on the W1 mesh,
 ///          solved by FGMRES.  Unconditionally stable (dt only bounded by the
 ///          *advection* CFL for accuracy), so allows much larger dt at moderate Pe.
 ///          Linear-solver convergence degrades at high Pe (Ra >> 1e6).
@@ -325,7 +329,7 @@ struct TimeSteppingParameters
     double t_end_Ma   = 100.0;
     double t_end      = 1.0;
     double dt_max_Ma  = 5.0;
-    double dt_min_Ma  = 0.1;
+    double dt_min_Ma  = 0.001;
     double dt_max     = 1.0;
     double dt_min     = 1.0;
 
@@ -366,6 +370,9 @@ struct DeveloperOptions
     bool extended_parameters = false; // If false, hide some of the parameters that are not relevant for 'standard' use.
     bool extended_diagnostics         = true; // Extended logging of solver diagnostics, memory footprint, etc.
     bool print_parameter_descriptions = true;
+
+    // Free-slip normals consistent with the discrete gradient (Bᵀ·1); false: r̂.
+    bool consistent_freeslip_normals = true;
 };
 
 struct Parameters
@@ -553,8 +560,8 @@ inline util::Result< std::variant< CLIHelp, Parameters > > parse_parameters( int
         app, "--refinement-level-subdomains", parameters.mesh_parameters.refinement_level_subdomains )
         ->group( "Domain" );
 
-    add_option_with_default( app, "--radius-cmb", parameters.mesh_parameters.radius_cmb_m )->group( "Domain" );
     add_option_with_default( app, "--radius-surface", parameters.mesh_parameters.radius_surface_m )->group( "Domain" );
+    add_option_with_default( app, "--radius-cmb", parameters.mesh_parameters.radius_cmb_m )->group( "Domain" );
 
     if ( parameters.devel_parameters.extended_parameters )
     {
@@ -606,21 +613,58 @@ inline util::Result< std::variant< CLIHelp, Parameters > > parse_parameters( int
         { "freeslip", BoundaryConditionsParameters::VelocityBC::FREE_SLIP },
     };
 
-    add_option_with_default( app, "--velocity-bc-cmb", parameters.boundary_parameters.velocity_bc_cmb )
-        ->transform( CLI::CheckedTransformer( velocity_bc_cmb_map, CLI::ignore_case ) )
-        ->default_val( "noslip" )
-        ->group( "Boundary Conditions" );
-
     add_option_with_default( app, "--velocity-bc-surface", parameters.boundary_parameters.velocity_bc_surface )
         ->transform( CLI::CheckedTransformer( velocity_bc_surface_map, CLI::ignore_case ) )
         ->default_val( "noslip" )
         ->group( "Boundary Conditions" );
 
-    add_option_with_default( app, "--temperature-cmb", parameters.boundary_parameters.temperature_cmb_K )
+    add_option_with_default( app, "--velocity-bc-cmb", parameters.boundary_parameters.velocity_bc_cmb )
+        ->transform( CLI::CheckedTransformer( velocity_bc_cmb_map, CLI::ignore_case ) )
+        ->default_val( "noslip" )
         ->group( "Boundary Conditions" );
 
     add_option_with_default( app, "--temperature-surface", parameters.boundary_parameters.temperature_surface_K )
         ->group( "Boundary Conditions" );
+
+    add_option_with_default( app, "--temperature-cmb", parameters.boundary_parameters.temperature_cmb_K )
+        ->group( "Boundary Conditions" );
+
+    // Plate parameters
+    add_flag_with_default(
+        app, "--apply-plate-velocities", parameters.boundary_parameters.plate_parameters.apply_plate_velocities )
+        ->group( "Plate Parameters" )
+        ->description(
+            "Assimilate plate velocities as surface boundary conditions. Enforces a no-slip condition at the surface." );
+
+    add_option_with_default(
+        app, "--initial-plate-age-Ma", parameters.boundary_parameters.plate_parameters.initial_plate_age )
+        ->group( "Plate Parameters" );
+
+    add_option_with_default(
+        app, "--final-plate-age-Ma", parameters.boundary_parameters.plate_parameters.final_plate_age )
+        ->group( "Plate Parameters" );
+
+    add_flag_with_default(
+        app,
+        "--interpolate-plates-in-time",
+        parameters.boundary_parameters.plate_parameters.interpolate_plates_in_time )
+        ->group( "Plate Parameters" )
+        ->description( "Interpolate between plate stages defined in the plate data (usually every 1 Ma)." );
+
+    add_option_with_default(
+        app, "--plates-topologies-path", parameters.boundary_parameters.plate_parameters.plates_topologies_path )
+        ->group( "Plate Parameters" )
+        ->description( "Paths to plate data." );
+
+    add_option_with_default(
+        app,
+        "--plates-reconstructions-path",
+        parameters.boundary_parameters.plate_parameters.plates_reconstructions_path )
+        ->group( "Plate Parameters" );
+
+    add_option_with_default(
+        app, "--plate-velocity-scaling", parameters.boundary_parameters.plate_parameters.plate_velocity_scaling )
+        ->group( "Plate Parameters" );
 
     //////////////////////////////
     /// Geophysical parameters ///
@@ -977,6 +1021,13 @@ inline util::Result< std::variant< CLIHelp, Parameters > > parse_parameters( int
         add_flag_with_default( app, "--extended-diagnostics", parameters.devel_parameters.extended_diagnostics )
             ->group( "Developer settings" )
             ->description( "Log detailed diagnostics on solver setup, memory footprint, etc." );
+        add_flag_with_default(
+            app,
+            "--consistent-freeslip-normals,!--consistent-freeslip-normals-off",
+            parameters.devel_parameters.consistent_freeslip_normals )
+            ->group( "Developer settings" )
+            ->description( "Use free-slip normals consistent with the discrete gradient (Bᵀ·1) on the fine-level "
+                           "Stokes operator. Use --consistent-freeslip-normals-off for r̂." );
     }
 
     try
@@ -1058,6 +1109,15 @@ inline util::Result< std::variant< CLIHelp, Parameters > > parse_parameters( int
         util::logroot << "--> T_surface, T_cmb, viscosity, Ra, internal_heating_rate, t_end, dt_max, dt_min.\n";
         util::logroot << "Output set to nondimensional.\n";
         util::logroot << "#############################################" << std::endl;
+    }
+
+    // Plate velocities require no-slip boundary at the surface
+    if ( parameters.boundary_parameters.plate_parameters.apply_plate_velocities &&
+         parameters.boundary_parameters.velocity_bc_surface != BoundaryConditionsParameters::VelocityBC::NO_SLIP )
+    {
+        util::logroot << "\n## Plate velocities require NO-SLIP boundary at the surface. Setting accordingly..."
+                      << std::endl;
+        parameters.boundary_parameters.velocity_bc_surface = BoundaryConditionsParameters::VelocityBC::NO_SLIP;
     }
 
     // Setting parameters for low-memory mode

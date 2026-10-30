@@ -159,8 +159,8 @@ struct InitialTemperatureParameters
 
     /// Spherical-harmonic perturbation degree l and order m (l >= 0, |m| <= l). Set l to 0 to
     /// disable the SH perturbation entirely (then perturbation_amplitude is ignored).
-    int sph_degree_l = 0;
-    int sph_order_m  = 0;
+    int sph_degree_l = 16;
+    int sph_order_m  = 16;
 
     /// Optional second spherical harmonic for combined modes (e.g. cubic symmetry
     /// T_perturb = Y_4^0 + (5/7) * Y_4^4).  Set sph_degree_l_2 > 0 to enable.
@@ -743,7 +743,7 @@ inline util::Result< std::variant< CLIHelp, Parameters > > parse_parameters( int
     add_option_with_default(
         app, "--initial-temperature-perturbation", parameters.physics_parameters.initial_temperature.perturbation )
         ->transform( CLI::CheckedTransformer( init_temp_perturbation_map, CLI::ignore_case ) )
-        ->default_val( "spherical-harmonics" )
+        ->default_val( "spherical-harmonics-superposition" )
         ->group( "Initial Temperature" )
         ->description(
             "'noise', 'spherical-harmonics' / 'sph' or 'spherical-harmonics-superposition' / 'sph-superposition' perturbation." );

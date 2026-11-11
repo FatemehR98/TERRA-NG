@@ -107,13 +107,8 @@ class LowPrecVCycle : public linalg::solvers::VelocityPrecHandle< ViscousDouble 
         for ( int l = 0; l < num_levels_; ++l )
         {
             inverse_diagonals_.emplace_back( "mg_inv_diag_" + std::to_string( l ), *domains[l], ownership_mask[l] );
-            VelVec ones( "mg_inv_diag_tmp_" + std::to_string( l ), *domains[l], ownership_mask[l] );
-            linalg::assign( ones, MGScalar( 1 ) );
-            A_[l].set_diagonal( true );
-            linalg::apply( A_[l], ones, inverse_diagonals_.back() );
-            A_[l].set_diagonal( false );
-            linalg::invert_entries( inverse_diagonals_.back() );
         }
+        compute_inverse_diagonals();
         for ( int l = 0; l < num_levels_; ++l )
         {
             std::vector< VelVec > smoother_tmps{ tmp_mg_[l], tmp_mg_2_[l] };
@@ -146,6 +141,19 @@ class LowPrecVCycle : public linalg::solvers::VelocityPrecHandle< ViscousDouble 
         z_ = std::make_unique< VelVec >( "mg_z", *domains[num_levels_ - 1], ownership_mask[num_levels_ - 1] );
     }
 
+    /// Rebuilds everything that depends on the viscosity from the passed (double) per-level viscosity:
+    /// the MGScalar viscosity copies read by the level operators, the smoothers' inverse diagonals, and
+    /// (in the next solve) the smoothers' spectral bounds. Call after the viscosity changed.
+    void refresh( const std::vector< linalg::VectorW1Scalar< double > >& eta )
+    {
+        for ( int l = 0; l < num_levels_; ++l )
+        {
+            kernels::common::copy_convert( eta[l].grid_data(), eta_[l].grid_data() );
+        }
+        compute_inverse_diagonals();
+        mg_->refresh_smoothers();
+    }
+
     /// Double interface: convert RHS down, run the MGScalar V-cycle, convert up.
     void solve_impl( ViscousDouble& /*A_double*/, SrcVecD& x, const DstVecD& b ) override
     {
@@ -156,6 +164,21 @@ class LowPrecVCycle : public linalg::solvers::VelocityPrecHandle< ViscousDouble 
     }
 
   private:
+    /// (Re-)computes the inverse operator diagonals on all levels. The smoothers share the underlying data.
+    void compute_inverse_diagonals()
+    {
+        for ( int l = 0; l < num_levels_; ++l )
+        {
+            // tmp_mg_ is smoother scratch and free to use outside of a solve.
+            auto& ones = tmp_mg_[l];
+            linalg::assign( ones, MGScalar( 1 ) );
+            A_[l].set_diagonal( true );
+            linalg::apply( A_[l], ones, inverse_diagonals_[l] );
+            A_[l].set_diagonal( false );
+            linalg::invert_entries( inverse_diagonals_[l] );
+        }
+    }
+
     int num_levels_;
 
     std::vector< linalg::VectorW1Scalar< MGScalar > > eta_;

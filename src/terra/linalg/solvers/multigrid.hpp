@@ -208,6 +208,23 @@ class Multigrid
     /// @param statistics Shared pointer to statistics table.
     void collect_statistics( const std::shared_ptr< util::Table >& statistics ) { statistics_ = statistics; }
 
+    /// @brief Requests all smoothers to re-estimate their spectral bounds in the next solve.
+    ///
+    /// Call this after the coefficients of the level operators (and the smoothers' inverse diagonals) changed,
+    /// e.g., after a viscosity update. The smoothers are stored by value, so this must go through the multigrid
+    /// solver. Requires a smoother type with `refresh_max_eigenvalue_estimate_in_next_solve()` (e.g., Chebyshev).
+    void refresh_smoothers()
+    {
+        for ( auto& smoother : smoothers_pre_ )
+        {
+            smoother.refresh_max_eigenvalue_estimate_in_next_solve();
+        }
+        for ( auto& smoother : smoothers_post_ )
+        {
+            smoother.refresh_max_eigenvalue_estimate_in_next_solve();
+        }
+    }
+
     /// @brief Solve the linear system using multigrid cycles.
     /// Calls the recursive V-cycle and updates statistics.
     /// @param A Operator (matrix).

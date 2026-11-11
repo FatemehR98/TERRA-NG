@@ -107,6 +107,7 @@ add_terra_test(test_xdmf_writer)
 add_terra_test(test_ev_rotation)
 add_terra_test(test_ev_advection_diffusion)
 add_terra_test(test_shear_heating)
+add_terra_test(test_strain_rate_viscosity)
 
 # Needs the plate reconstruction data, which is not in the repository. Point it at the directory
 # holding topologies_0-410Ma.geojson and TomoPAC2.rot via TERRA_PLATE_DATA_DIR (or argv[1]);

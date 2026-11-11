@@ -313,6 +313,10 @@ Result<> run( const Parameters& prm )
     xdmf_output->add( Tdev.grid_data() );              // Temperature deviation
     xdmf_output->add( u.block_1().grid_data() );       // Velocity
     xdmf_output->add( stokes.eta_fine().grid_data() ); // Viscosity
+    if ( stokes.nonlinear_rheology() )
+    {
+        xdmf_output->add( stokes.strain_rate().grid_data() ); // Second invariant of the strain rate
+    }
     if ( pda_form )
     {
         xdmf_output->add( density->grid_data() ); // Density
@@ -348,6 +352,10 @@ Result<> run( const Parameters& prm )
         if ( pda_form ) // Add density output
             fields.scalar_fields.push_back( { density->grid_data(), prm.physics_parameters.reference_density, true } );
 
+        if ( stokes.nonlinear_rheology() ) // Add strain rate output
+            fields.scalar_fields.push_back(
+                { stokes.strain_rate().grid_data(), prm.physics_parameters.calc_strain_rate_per_s, true } );
+
         if ( prm.io_parameters.output_pressure )
             fields.pressure_field.emplace(
                 u.block_2().grid_data(),
@@ -373,7 +381,9 @@ Result<> run( const Parameters& prm )
     // Update Tdev
     subtract_radial_profile( Tdev, T, T_ref, *domains[velocity_level] );
 
-    // Compute temperature-dependent viscosity
+    // Compute temperature-dependent viscosity.
+    // With a non-linear rheology this is the Newtonian part only; the strain-rate dependence is applied inside
+    // the (then iterative) Stokes solve.
     if ( prm.physics_parameters.viscosity_parameters.law != ViscosityLaw::CONSTANT )
     {
         logroot << "Computing initial temperature-dependent viscosity ..." << std::endl;
@@ -576,9 +586,10 @@ Result<> run( const Parameters& prm )
     // ---Radial profiles---
 
     // Scaling factors for redimensionalisation
-    ScalarType T_scale   = ScalarType( 1 );
-    ScalarType eta_scale = ScalarType( 1 );
-    ScalarType u_scale   = ScalarType( 1 );
+    ScalarType T_scale           = ScalarType( 1 );
+    ScalarType eta_scale         = ScalarType( 1 );
+    ScalarType u_scale           = ScalarType( 1 );
+    ScalarType strain_rate_scale = ScalarType( 1 );
 
     // We either want to write out dimensional depth or nondimensional radius
     std::vector< double > radial_coords = domains[velocity_level]->domain_info().radii();
@@ -589,6 +600,8 @@ Result<> run( const Parameters& prm )
         T_scale   = prm.boundary_parameters.delta_T_K;
         eta_scale = prm.physics_parameters.viscosity_parameters.reference_viscosity;
         u_scale   = prm.physics_parameters.calc_cm_per_year;
+
+        strain_rate_scale = prm.physics_parameters.calc_strain_rate_per_s;
 
         // Convert radii to dimensional depth
         std::transform( radial_coords.begin(), radial_coords.end(), radial_coords.begin(), [&]( double r ) {
@@ -616,6 +629,17 @@ Result<> run( const Parameters& prm )
             prm.time_stepping_parameters.timestep_initial,
             eta_scale,
             radial_label );
+        if ( stokes.nonlinear_rheology() )
+        {
+            compute_and_write_radial_profiles(
+                stokes.strain_rate(),
+                subdomain_shell_idx,
+                radial_coords,
+                prm,
+                prm.time_stepping_parameters.timestep_initial,
+                strain_rate_scale,
+                radial_label );
+        }
         compute_and_write_velocity_radial_profiles(
             u.block_1(),
             coords_shell[velocity_level],
@@ -821,6 +845,17 @@ Result<> run( const Parameters& prm )
                 T, subdomain_shell_idx, radial_coords, prm, timestep, T_scale, radial_label );
             compute_and_write_radial_profiles(
                 stokes.eta_fine(), subdomain_shell_idx, radial_coords, prm, timestep, eta_scale, radial_label );
+            if ( stokes.nonlinear_rheology() )
+            {
+                compute_and_write_radial_profiles(
+                    stokes.strain_rate(),
+                    subdomain_shell_idx,
+                    radial_coords,
+                    prm,
+                    timestep,
+                    strain_rate_scale,
+                    radial_label );
+            }
             compute_and_write_velocity_radial_profiles(
                 u.block_1(),
                 coords_shell[velocity_level],

@@ -15,11 +15,14 @@
 #include "fe/strong_algebraic_freeslip_enforcement.hpp"
 #include "fe/wedge/linearforms/shell/inv_rho_grad_rho_dot_u.hpp"
 #include "fe/wedge/operators/shell/epsilon_divdiv_stokes.hpp"
+#include "fe/wedge/operators/shell/injection.hpp"
 #include "fe/wedge/operators/shell/kmass.hpp"
 #include "fe/wedge/operators/shell/prolongation_constant.hpp"
 #include "fe/wedge/operators/shell/restriction_constant.hpp"
 #include "fe/wedge/operators/shell/stokes.hpp"
 #include "fe/wedge/operators/shell/vector_mass.hpp"
+#include "geophysics/viscosity/strain_rate_dependent_viscosity.hpp"
+#include "geophysics/viscosity/strain_rate_invariant.hpp"
 #include "geophysics/viscosity/viscosity_interpolation.hpp"
 #include "grid/grid_types.hpp"
 #include "grid/shell/agglomerated_distribution.hpp"
@@ -286,6 +289,60 @@ class StokesContext
         // Assign radial_viscosity_profile at highest level to class member eta_profile_, since we need the reference profile for viscosity laws
         eta_profile_ = radial_viscosity_profile[velocity_level_];
 
+        // ---------------- Non-linear (strain-rate dependent) rheology ----------------
+        // eta_[velocity_level_] always holds the effective viscosity the Stokes operator works with. With a
+        // strain-rate dependent rheology, the Newtonian part (ViscosityLaw: radial profile, temperature, depth)
+        // is kept separately, and the effective viscosity is recomputed from it in every non-linear iteration.
+        const auto& stokes_prm = prm_.stokes_solver_parameters;
+        nonlinear_rheology_    = prm_.physics_parameters.viscosity_parameters.strain_rate_law !=
+                                 geophysics::viscosity::StrainRateLaw::NONE;
+        if ( nonlinear_rheology_ )
+        {
+            eta_newtonian_ = VectorW1Scalar< ScalarType >(
+                "eta_newtonian", *domains_[velocity_level_], ownership_mask_[velocity_level_] );
+            linalg::assign( eta_newtonian_, eta_[velocity_level_] );
+
+            strain_rate_ = VectorW1Scalar< ScalarType >(
+                "strain_rate", *domains_[velocity_level_], ownership_mask_[velocity_level_] );
+            if ( stokes_prm.nonlinear_relaxation != 1.0 )
+            {
+                strain_rate_tmp_ = VectorW1Scalar< ScalarType >(
+                    "strain_rate_tmp", *domains_[velocity_level_], ownership_mask_[velocity_level_] );
+            }
+
+            strain_rate_invariant_ = std::make_unique< StrainRateInvariant >(
+                *domains_[velocity_level_], coords_shell_[velocity_level_], coords_radii_[velocity_level_] );
+
+            logroot << "Non-linear rheology: "
+                    << ( prm_.physics_parameters.viscosity_parameters.strain_rate_law ==
+                                 geophysics::viscosity::StrainRateLaw::POWER_LAW ?
+                             "power law" :
+                             "composite (Newtonian + power law)" )
+                    << ", stress exponent n = " << prm_.physics_parameters.viscosity_parameters.stress_exponent
+                    << ", reference strain rate (nondimensional) = "
+                    << prm_.physics_parameters.viscosity_parameters.reference_strain_rate << ".\n"
+                    << "Non-linear Stokes iteration: at most " << stokes_prm.nonlinear_max_iterations
+                    << " Picard iterations, relative tolerance (velocity change or residual) "
+                    << stokes_prm.nonlinear_relative_tolerance << ", relaxation factor "
+                    << stokes_prm.nonlinear_relaxation << "." << std::endl;
+        }
+
+        refresh_preconditioner_ =
+            stokes_prm.pc_refresh == PreconditionerRefresh::ALWAYS ||
+            ( stokes_prm.pc_refresh == PreconditionerRefresh::AUTO && nonlinear_rheology_ );
+
+        // The coarse-level viscosities can only be refreshed by injection if all levels share the same
+        // subdomain layout on every process, i.e., not when coarse levels are agglomerated onto sub-communicators.
+        coarse_levels_share_layout_ =
+            std::none_of( agglom_factors.begin(), agglom_factors.end(), []( int f ) { return f > 1; } );
+        if ( refresh_preconditioner_ && !coarse_levels_share_layout_ )
+        {
+            logroot << "WARNING: MG agglomeration is active. The coarse-level viscosities (and thus the coarse-grid "
+                       "operators and the Schur complement preconditioner) are NOT updated when the viscosity "
+                       "changes; only the fine-level smoother is."
+                    << std::endl;
+        }
+
         // ---------------- GCA element selection ----------------
         GCAElements_  = VectorW1Scalar< ScalarType >( "GCAElements", *domains_[0], ownership_mask_[0] );
         const int gca = prm_.stokes_solver_parameters.gca;
@@ -440,16 +497,7 @@ class StokesContext
             // GCA assembly (top-down)
             if ( gca > 0 )
             {
-                for ( int level = num_levels_ - 2; level >= 0; level-- )
-                {
-                    logroot << "Assembling GCA on level " << prm_.mesh_parameters.refinement_level_mesh_min + level
-                            << std::endl;
-                    linalg::solvers::TwoGridGCA< ScalarType, Viscous >(
-                        ( level == num_levels_ - 2 ) ? K_neumann_->block_11() : A_c_[level + 1],
-                        A_c_[level],
-                        level,
-                        GCAElements_.grid_data() );
-                }
+                assemble_gca( /*verbose=*/true );
             }
 
             // ---------------- Inverse diagonals ----------------
@@ -457,27 +505,8 @@ class StokesContext
             {
                 inverse_diagonals_.emplace_back(
                     "inverse_diagonal_" + std::to_string( level ), *domains_[level], ownership_mask_[level] );
-
-                if ( domains_[level]->comm() == MPI_COMM_NULL )
-                    continue;
-
-                VectorW1Vec< ScalarType > tmp(
-                    "inverse_diagonal_tmp" + std::to_string( level ), *domains_[level], ownership_mask_[level] );
-                linalg::assign( tmp, ScalarType( 1 ) );
-                if ( level == num_levels_ - 1 )
-                {
-                    K_->block_11().set_diagonal( true );
-                    linalg::apply( K_->block_11(), tmp, inverse_diagonals_.back() );
-                    K_->block_11().set_diagonal( false );
-                }
-                else
-                {
-                    A_c_[level].set_diagonal( true );
-                    linalg::apply( A_c_[level], tmp, inverse_diagonals_.back() );
-                    A_c_[level].set_diagonal( false );
-                }
-                linalg::invert_entries( inverse_diagonals_.back() );
             }
+            compute_inverse_diagonals();
 
             // ---------------- Smoothers (Chebyshev) ----------------
             logroot << "Setting up multigrid smoother ..." << std::endl;
@@ -679,8 +708,9 @@ class StokesContext
         switch ( prm_.stokes_solver_parameters.mg_precision )
         {
         case MGPrecision::FLOAT:
-            vel_impl = std::make_shared< LowPrecVCycle< float, Viscous > >(
+            low_prec_vcycle_ = std::make_shared< LowPrecVCycle< float, Viscous > >(
                 domains_, coords_shell_, coords_radii_, boundary_mask_, ownership_mask_, eta_, bcs_, prm_, table_ );
+            vel_impl = low_prec_vcycle_;
             break;
         case MGPrecision::HALF:
             // The EpsDivDiv operator does not compile/run with half-precision geometry
@@ -780,14 +810,29 @@ class StokesContext
 
     linalg::VectorW1IsoW2W1< ScalarType >& solution() { return stok_vecs_["u"]; }
 
+    /// Effective viscosity on the finest level (what the Stokes operator works with).
     linalg::VectorW1Scalar< ScalarType >&  eta_fine() { return eta_[velocity_level_]; }
     long                                   num_dofs_pressure() const { return num_dofs_pressure_; }
     const grid::shell::BoundaryConditions& boundary_conditions() const { return bcs_; }
 
-    /// Update the fine-level viscosity from the current temperature using the
-    /// configured viscosity law. No-op for ViscosityLaw::CONSTANT. Coarse-
-    /// level eta (used by MG smoothing/coarse solves) is intentionally not
-    /// touched, matching the pre-refactor behavior.
+    /// True if the viscosity depends on the strain rate (StrainRateLaw != NONE), i.e., if solve() iterates.
+    bool nonlinear_rheology() const { return nonlinear_rheology_; }
+
+    /// Nodal second invariant of the strain rate the effective viscosity was computed from.
+    /// Only allocated (and only meaningful after the first solve) with a non-linear rheology.
+    linalg::VectorW1Scalar< ScalarType >& strain_rate() { return strain_rate_; }
+
+    /// Update the fine-level Newtonian viscosity from the current temperature using the configured viscosity
+    /// law. No-op for ViscosityLaw::CONSTANT.
+    ///
+    /// Linear rheology: writes the viscosity the Stokes operator works with (eta_fine()) directly.
+    /// Non-linear rheology: writes the Newtonian part only; the effective viscosity is recomputed from it and
+    /// the strain rate in every non-linear iteration of solve().
+    ///
+    /// Coarse-level eta (used by MG smoothing/coarse solves) and the other viscosity-dependent parts of the
+    /// preconditioner are only brought up to date in solve() if requested via --stokes-pc-refresh (default:
+    /// only with a non-linear rheology), otherwise they intentionally keep the setup-time radial profile,
+    /// matching the pre-refactor behavior.
     void update_viscosity( const linalg::VectorW1Scalar< ScalarType >& T )
     {
         if ( prm_.physics_parameters.viscosity_parameters.law == ViscosityLaw::CONSTANT )
@@ -799,7 +844,7 @@ class StokesContext
             grid::shell::local_domain_md_range_policy_nodes( *domains_[velocity_level_] ),
             ViscosityFromTemperature{
                 prm_.physics_parameters.viscosity_parameters.law,
-                eta_[velocity_level_].grid_data(),
+                nonlinear_rheology_ ? eta_newtonian_.grid_data() : eta_[velocity_level_].grid_data(),
                 T.grid_data(),
                 eta_profile_,
                 coords_radii_[velocity_level_],
@@ -809,12 +854,22 @@ class StokesContext
                 prm_.physics_parameters.viscosity_parameters.min_viscosity,
                 prm_.physics_parameters.viscosity_parameters.max_viscosity } );
         Kokkos::fence();
+
+        viscosity_changed_ = true;
     }
 
-    /// Solve  K · u = f(T_for_buoyancy, rho, alpha)  with the configured
-    /// FGMRES + MG/Schur preconditioner.  When `log_convergence` is true,
-    /// the per-step Stokes and coarse-grid PCG tables are printed;
-    /// in either case the table is cleared at the end of the call.
+    /// Solve  K(eta) · u = f(T_for_buoyancy, rho, alpha)  with the configured
+    /// FGMRES + MG/Schur preconditioner.
+    ///
+    /// With a strain-rate dependent rheology, eta = eta(u) and the system is non-linear. It is then solved by a
+    /// Picard (fixed-point) iteration: compute eta from the strain rate of the current velocity, assemble the
+    /// rhs, (refresh the preconditioner,) solve the linear system starting from the current velocity, repeat
+    /// until the relative velocity change of an iteration or the relative non-linear residual drops below the
+    /// tolerance.
+    ///
+    /// When `log_convergence` is true, the per-step Stokes table (linear rheology) or a summary of the
+    /// non-linear iteration (non-linear rheology) is printed; in either case the table is cleared at the end
+    /// of the call.
     template < typename RhoFieldType >
     void solve(
         const linalg::VectorW1Scalar< ScalarType >&                   T_for_buoyancy,
@@ -826,8 +881,57 @@ class StokesContext
     {
         util::Timer timer_stokes( "stokes" );
 
-        util::logroot << "Setting up Stokes rhs ..." << std::endl;
+        if ( nonlinear_rheology_ )
+        {
+            solve_nonlinear( T_for_buoyancy, u_dirichlet, rho, alpha, compressible, log_convergence );
+        }
+        else
+        {
+            // Linear rheology: bring the preconditioner up to date with the viscosity if requested.
+            if ( refresh_preconditioner_ && viscosity_changed_ )
+            {
+                refresh_preconditioner();
+            }
+            viscosity_changed_ = false;
 
+            util::logroot << "Setting up Stokes rhs ..." << std::endl;
+            assemble_rhs( T_for_buoyancy, u_dirichlet, rho, alpha, compressible );
+
+            util::logroot << "Solving Stokes ..." << std::endl;
+            solve_linear();
+
+            if ( log_convergence )
+            {
+                table_->query_rows_equals( "tag", "stokes_fgmres" ).print_pretty();
+                //table_->query_rows_equals( "tag", "coarse_grid_pcg" ).print_pretty();
+            }
+        }
+        table_->clear();
+
+        // "Normalize" pressure (subtract average).
+        auto&            p = stok_vecs_["u"].block_2();
+        const ScalarType avg_pressure_approximation =
+            kernels::common::masked_sum( p.grid_data(), p.mask_data(), grid::NodeOwnershipFlag::OWNED ) /
+            static_cast< ScalarType >( num_dofs_pressure_ );
+        linalg::lincomb( p, { 1.0 }, { p }, -avg_pressure_approximation );
+
+        // Store u_prev for the next timestep
+        linalg::assign( stok_vecs_["u_prev"], stok_vecs_["u"] );
+    }
+
+  private:
+    using StrainRateInvariant = geophysics::viscosity::StrainRateInvariant< ScalarType >;
+
+    /// Assembles the Stokes rhs f: buoyancy, strong velocity BC enforcement (uses the current viscosity for
+    /// inhomogeneous Dirichlet values) and, if compressible, the mass equation rhs (uses "u_prev").
+    template < typename RhoFieldType >
+    void assemble_rhs(
+        const linalg::VectorW1Scalar< ScalarType >&                   T_for_buoyancy,
+        const std::optional< linalg::VectorW1IsoW2W1< ScalarType > >& u_dirichlet,
+        const RhoFieldType&                                           rho,
+        const grid::Grid2DDataScalar< ScalarType >&                   alpha,
+        bool                                                          compressible )
+    {
         Kokkos::parallel_for(
             "Stokes rhs interpolation",
             grid::shell::local_domain_md_range_policy_nodes( *domains_[velocity_level_] ),
@@ -899,30 +1003,276 @@ class StokesContext
 
             linalg::apply( mass_rhs, stok_vecs_["f"].block_2() );
         }
+    }
 
-        util::logroot << "Solving Stokes ..." << std::endl;
-
+    /// One linear Stokes solve with the current viscosity, starting from the current solution.
+    void solve_linear()
+    {
         if ( use_float_basis_ )
             ::terra::linalg::solvers::solve( *stokes_fgmres_float_, *K_, stok_vecs_["u"], stok_vecs_["f"] );
         else
             ::terra::linalg::solvers::solve( *stokes_fgmres_double_, *K_, stok_vecs_["u"], stok_vecs_["f"] );
+    }
+
+    /// Picard iteration for the strain-rate dependent rheology, see solve().
+    template < typename RhoFieldType >
+    void solve_nonlinear(
+        const linalg::VectorW1Scalar< ScalarType >&                   T_for_buoyancy,
+        const std::optional< linalg::VectorW1IsoW2W1< ScalarType > >& u_dirichlet,
+        const RhoFieldType&                                           rho,
+        const grid::Grid2DDataScalar< ScalarType >&                   alpha,
+        bool                                                          compressible,
+        bool                                                          log_convergence )
+    {
+        const auto& stokes_prm = prm_.stokes_solver_parameters;
+        auto&       u          = stok_vecs_["u"];
+        auto&       f          = stok_vecs_["f"];
+        auto&       u_old      = stok_vecs_["u_prev"];
+        auto&       tmp        = triangular_prec_tmp_; // rhs assembly / preconditioner scratch, free in between
+
+        util::logroot << "Solving non-linear Stokes ..." << std::endl;
+
+        util::Table nonlinear_table;
+        nonlinear_table.set_column_order(
+            { "picard_it",
+              "nonlin_res_abs",
+              "nonlin_res_rel",
+              "fgmres_its",
+              "fgmres_res_rel",
+              "du_rel",
+              "eta_min",
+              "eta_max",
+              "eps_II_max" } );
+
+        const ScalarType tolerance = stokes_prm.nonlinear_relative_tolerance;
+        const MPI_Comm   comm      = domains_[velocity_level_]->comm();
+
+        bool converged             = false;
+        bool converged_by_residual = false;
+        int  iteration             = 0; // number of linear solves done
+
+        for ( ; iteration < stokes_prm.nonlinear_max_iterations && !converged; ++iteration )
+        {
+            // eta = eta( eps_II( u ) )
+            update_effective_viscosity( ScalarType( stokes_prm.nonlinear_relaxation ) );
+
+            // Keep the current iterate: it is the lagged velocity of the (compressible) rhs, and the reference
+            // for the velocity change of this iteration.
+            linalg::assign( u_old, u );
+
+            // The rhs depends on the viscosity (inhomogeneous Dirichlet values, e.g., plates) and, if
+            // compressible, on the lagged velocity, so it is part of the fixed-point iteration.
+            assemble_rhs( T_for_buoyancy, u_dirichlet, rho, alpha, compressible );
+            const ScalarType f_norm = linalg::norm_2( f );
+
+            // Non-linear residual of the current iterate: f - K( eta( u ) ) u.
+            linalg::apply( *K_, u, tmp );
+            linalg::lincomb( tmp, { ScalarType( 1 ), ScalarType( -1 ) }, { f, tmp } );
+            const ScalarType nonlinear_residual = linalg::norm_2( tmp );
+            const ScalarType nonlinear_residual_rel =
+                ( f_norm > ScalarType( 0 ) ) ? nonlinear_residual / f_norm : ScalarType( 0 );
+
+            // Converged in terms of the non-linear residual? Not checked before the first solve of this call,
+            // which is always done (new rhs). Unlike the velocity change, this criterion is not affected by
+            // rigid body rotations drifting between the solves (free-slip on both boundaries).
+            if ( iteration > 0 && nonlinear_residual_rel <= tolerance )
+            {
+                nonlinear_table.add_row(
+                    { { "picard_it", iteration },
+                      { "nonlin_res_abs", nonlinear_residual },
+                      { "nonlin_res_rel", nonlinear_residual_rel },
+                      { "eta_min", kernels::common::min_entry( eta_[velocity_level_].grid_data(), comm ) },
+                      { "eta_max", kernels::common::max_entry( eta_[velocity_level_].grid_data(), comm ) },
+                      { "eps_II_max", kernels::common::max_entry( strain_rate_.grid_data(), comm ) } } );
+                converged             = true;
+                converged_by_residual = true;
+                break;
+            }
+
+            // Make the preconditioner consistent with the new viscosity and solve the linear problem.
+            if ( refresh_preconditioner_ )
+            {
+                refresh_preconditioner();
+            }
+
+            solve_linear();
+
+            // Relative velocity change of this iteration.
+            linalg::lincomb( tmp, { ScalarType( 1 ), ScalarType( -1 ) }, { u, u_old } );
+            const ScalarType du_norm = linalg::norm_2( tmp.block_1() );
+            const ScalarType u_norm  = linalg::norm_2( u.block_1() );
+            const ScalarType du_rel  = ( u_norm > ScalarType( 0 ) ) ? du_norm / u_norm : ScalarType( 0 );
+
+            // Linear solver statistics of this iteration (row 0 is the initial residual).
+            const auto fgmres_residuals =
+                table_->query_rows_equals( "tag", "stokes_fgmres" ).column_as_vector< double >( "relative_residual" );
+            table_->clear();
+
+            nonlinear_table.add_row(
+                { { "picard_it", iteration },
+                  { "nonlin_res_abs", nonlinear_residual },
+                  { "nonlin_res_rel", nonlinear_residual_rel },
+                  { "fgmres_its", static_cast< int >( fgmres_residuals.size() ) - 1 },
+                  { "fgmres_res_rel", fgmres_residuals.empty() ? 0.0 : fgmres_residuals.back() },
+                  { "du_rel", du_rel },
+                  { "eta_min", kernels::common::min_entry( eta_[velocity_level_].grid_data(), comm ) },
+                  { "eta_max", kernels::common::max_entry( eta_[velocity_level_].grid_data(), comm ) },
+                  { "eps_II_max", kernels::common::max_entry( strain_rate_.grid_data(), comm ) } } );
+
+            converged = du_rel <= tolerance;
+        }
+
+        // Leave viscosity and strain rate consistent with the final velocity (output, shear heating, ...), i.e.,
+        // without relaxation. The preconditioner is refreshed in the first iteration of the next solve.
+        update_effective_viscosity( ScalarType( 1 ) );
 
         if ( log_convergence )
         {
-            table_->query_rows_equals( "tag", "stokes_fgmres" ).print_pretty();
-            //table_->query_rows_equals( "tag", "coarse_grid_pcg" ).print_pretty();
+            // Per iteration: non-linear residual |f - K(eta(u)) u| before the linear solve (absolute and
+            // relative to |f|), FGMRES iterations and achieved relative residual, relative velocity change,
+            // and the viscosity range / max. strain rate invariant the linear solve was run with (nondimensional).
+            // A last row without solver columns is the residual check that ended the iteration.
+            nonlinear_table.print_pretty();
         }
-        table_->clear();
+        util::logroot << "Non-linear Stokes iteration " << ( converged ? "converged" : "did NOT converge" ) << " after "
+                      << iteration << " Picard iteration(s) (tolerance " << tolerance << ", "
+                      << ( !converged ? "neither relative velocity change nor relative residual reached it" :
+                           converged_by_residual ? "reached by the relative non-linear residual" :
+                                                   "reached by the relative velocity change" )
+                      << ")." << std::endl;
+    }
 
-        // "Normalize" pressure (subtract average).
-        auto&            p = stok_vecs_["u"].block_2();
-        const ScalarType avg_pressure_approximation =
-            kernels::common::masked_sum( p.grid_data(), p.mask_data(), grid::NodeOwnershipFlag::OWNED ) /
-            static_cast< ScalarType >( num_dofs_pressure_ );
-        linalg::lincomb( p, { 1.0 }, { p }, -avg_pressure_approximation );
+    /// Recomputes the strain rate invariant from the current velocity and from it (and the Newtonian viscosity)
+    /// the effective viscosity on the finest level.
+    ///
+    /// @param relaxation 1: the viscosity is evaluated with the strain rate of the current velocity. Otherwise
+    ///                   with a relaxed strain rate, see StrainRateInvariant::compute_relaxed().
+    void update_effective_viscosity( const ScalarType relaxation )
+    {
+        util::Timer timer( "viscosity_update_nonlinear" );
 
-        // Store u_prev for the next timestep
-        linalg::assign( stok_vecs_["u_prev"], stok_vecs_["u"] );
+        const auto& visc_prm = prm_.physics_parameters.viscosity_parameters;
+        auto&       velocity = stok_vecs_["u"].block_1();
+
+        if ( linalg::norm_2( velocity ) > ScalarType( 0 ) )
+        {
+            if ( relaxation == ScalarType( 1 ) )
+            {
+                strain_rate_invariant_->compute( velocity, strain_rate_ );
+            }
+            else
+            {
+                strain_rate_invariant_->compute_relaxed( velocity, strain_rate_, relaxation, strain_rate_tmp_ );
+            }
+        }
+        else
+        {
+            // No velocity yet (very first solve without checkpoint): there is no strain rate to evaluate the
+            // law with. Start the iteration at the reference strain rate instead, where the power law
+            // returns the Newtonian viscosity. (A zero strain rate would start it at the upper viscosity limit.)
+            linalg::assign( strain_rate_, ScalarType( visc_prm.reference_strain_rate ) );
+        }
+
+        Kokkos::parallel_for(
+            "viscosity_from_strain_rate",
+            grid::shell::local_domain_md_range_policy_nodes( *domains_[velocity_level_] ),
+            geophysics::viscosity::StrainRateDependentViscosityKernel< ScalarType >{
+                visc_prm.strain_rate_law,
+                eta_[velocity_level_].grid_data(),
+                eta_newtonian_.grid_data(),
+                strain_rate_.grid_data(),
+                ScalarType( visc_prm.reference_strain_rate ),
+                ScalarType( visc_prm.stress_exponent ),
+                ScalarType( visc_prm.min_viscosity ),
+                ScalarType( visc_prm.max_viscosity ) } );
+        Kokkos::fence();
+    }
+
+    /// Makes the viscosity-dependent parts of the preconditioner consistent with the current fine-level
+    /// viscosity eta_[velocity_level_]:
+    ///   1) coarse-level viscosities (injection), which the re-discretised coarse-grid operators read directly,
+    ///   2) the viscosity-weighted lumped pressure mass matrix (Schur complement preconditioner),
+    ///   3) velocity multigrid: Galerkin coarse-grid matrices (if gca > 0), the smoothers' inverse diagonals on
+    ///      all levels, and (in the next solve) the smoothers' spectral bounds.
+    /// The fine-level operator itself is matrix-free and always reads the current viscosity.
+    void refresh_preconditioner()
+    {
+        util::Timer timer( "stokes_preconditioner_refresh" );
+
+        // 1) Coarse-level viscosities. Nodes are nested, so this samples the fine viscosity at the coarse
+        //    nodes, consistent with how the coarse viscosities are initialised from the radial profile.
+        if ( coarse_levels_share_layout_ )
+        {
+            for ( int level = num_levels_ - 2; level >= 0; level-- )
+            {
+                fe::wedge::operators::shell::inject( *domains_[level], eta_[level + 1], eta_[level] );
+            }
+        }
+
+        // 2) Schur complement preconditioner: lumped pressure mass matrix weighted with 1 / eta.
+        //    pmass_ reads k_pm_, inv_lumped_pmass_ reads lumped_diagonal_pmass_ (and expects its inverse).
+        {
+            assign( k_pm_, eta_[pressure_level_] );
+            linalg::invert_entries( k_pm_ );
+
+            auto& ones = triangular_prec_tmp_.block_2(); // free between linear solves
+            linalg::assign( ones, ScalarType( 1 ) );
+            linalg::apply( *pmass_, ones, lumped_diagonal_pmass_ );
+            linalg::invert_entries( lumped_diagonal_pmass_ );
+        }
+
+        // 3) Velocity multigrid.
+        if ( prec_11_ )
+        {
+            if ( prm_.stokes_solver_parameters.gca > 0 )
+            {
+                assemble_gca( /*verbose=*/false );
+            }
+            compute_inverse_diagonals();
+            prec_11_->refresh_smoothers();
+        }
+        else if ( low_prec_vcycle_ )
+        {
+            low_prec_vcycle_->refresh( eta_ );
+        }
+    }
+
+    /// (Re-)assembles the Galerkin coarse-grid matrices top-down from the current fine-level operator.
+    void assemble_gca( bool verbose )
+    {
+        for ( int level = num_levels_ - 2; level >= 0; level-- )
+        {
+            if ( verbose )
+            {
+                util::logroot << "Assembling GCA on level " << prm_.mesh_parameters.refinement_level_mesh_min + level
+                              << std::endl;
+            }
+            linalg::solvers::TwoGridGCA< ScalarType, Viscous >(
+                ( level == num_levels_ - 2 ) ? K_neumann_->block_11() : A_c_[level + 1],
+                A_c_[level],
+                level,
+                GCAElements_.grid_data() );
+        }
+    }
+
+    /// (Re-)computes the inverse diagonals of the double-precision velocity operators on all levels.
+    /// The smoothers share the underlying data.
+    void compute_inverse_diagonals()
+    {
+        for ( int level = 0; level < num_levels_; level++ )
+        {
+            if ( domains_[level]->comm() == MPI_COMM_NULL )
+                continue;
+
+            // tmp_mg_ is smoother scratch and free to use outside of a solve.
+            auto& ones = tmp_mg_[level];
+            linalg::assign( ones, ScalarType( 1 ) );
+            auto& A = ( level == num_levels_ - 1 ) ? K_->block_11() : A_c_[level];
+            A.set_diagonal( true );
+            linalg::apply( A, ones, inverse_diagonals_[level] );
+            A.set_diagonal( false );
+            linalg::invert_entries( inverse_diagonals_[level] );
+        }
     }
 
   private:
@@ -951,6 +1301,9 @@ class StokesContext
     // destroyed later, so things that other members hold by-reference (eta_,
     // stok_vecs_, *_tmp_*) must come first.
     std::vector< linalg::VectorW1Scalar< ScalarType > >            eta_;
+    linalg::VectorW1Scalar< ScalarType >                           eta_newtonian_; // non-linear rheology only
+    linalg::VectorW1Scalar< ScalarType >                           strain_rate_;   // non-linear rheology only
+    linalg::VectorW1Scalar< ScalarType >                           strain_rate_tmp_; // relaxed non-linear iteration only
     linalg::VectorW1Scalar< ScalarType >                           GCAElements_;
     std::map< std::string, linalg::VectorW1IsoW2W1< ScalarType > > stok_vecs_;
     std::vector< linalg::VectorW1IsoW2W1< ScalarType > >           stokes_tmp_fgmres_;   // double path
@@ -981,6 +1334,16 @@ class StokesContext
     std::vector< grid::Grid4DDataScalar< grid::NodeOwnershipFlag > > mask_upper_;
 
     std::unique_ptr< PrecVisc > prec_11_;
+
+    // Reduced-precision velocity multigrid (--stokes-mg-precision float); null otherwise. Kept to refresh it.
+    std::shared_ptr< LowPrecVCycle< float, Viscous > > low_prec_vcycle_;
+
+    // Non-linear (strain-rate dependent) rheology and preconditioner refresh, see solve().
+    bool                                   nonlinear_rheology_         = false;
+    bool                                   refresh_preconditioner_     = false;
+    bool                                   coarse_levels_share_layout_ = true;
+    bool                                   viscosity_changed_          = false;
+    std::unique_ptr< StrainRateInvariant > strain_rate_invariant_;
 
     // Schur preconditioner pieces.
     linalg::VectorW1Scalar< ScalarType > k_pm_;

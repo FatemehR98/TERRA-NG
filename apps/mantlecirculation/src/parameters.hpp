@@ -3,6 +3,7 @@
 #include <string>
 #include <variant>
 
+#include "geophysics/viscosity/strain_rate_dependent_viscosity.hpp"
 #include "util/cli11_config.hpp" // Custom formatter
 #include "util/cli11_helper.hpp"
 #include "util/info.hpp"
@@ -100,10 +101,32 @@ enum class ViscosityLaw
     ARRHENIUS
 };
 
+/// Strain-rate dependence of the viscosity (non-linear rheology), applied on top of the ViscosityLaw:
+///   NONE      : eta = eta_N (Newtonian, default).
+///   POWER_LAW : eta = eta_N * ( eps_II / eps_0 )^( ( 1 - n ) / n ).
+///   COMPOSITE : 1 / eta = 1 / eta_N + 1 / eta_POWER_LAW.
+/// with eta_N the (temperature- and depth-dependent) viscosity given by the ViscosityLaw, eps_II the second
+/// invariant of the strain rate, eps_0 = `reference_strain_rate` and n = `stress_exponent`.
+/// See geophysics/viscosity/strain_rate_dependent_viscosity.hpp for details.
+using geophysics::viscosity::StrainRateLaw;
+
 struct ViscosityParameters
 {
     /// Viscosity law selector — see ViscosityLaw class above.
     ViscosityLaw law = ViscosityLaw::CONSTANT;
+
+    /// Strain-rate dependence selector (non-linear rheology) — see StrainRateLaw above.
+    /// Anything but NONE makes the Stokes problem non-linear, see the `nonlinear_*` Stokes solver parameters.
+    StrainRateLaw strain_rate_law = StrainRateLaw::NONE;
+
+    /// Stress exponent n >= 1 of the power law. n = 1 is Newtonian, n ~ 3 - 3.5 is typical for dislocation creep.
+    /// Ignored when `strain_rate_law == NONE`.
+    double stress_exponent = 3.5;
+
+    /// Reference strain rate eps_0 in 1/s (nondimensionalised internally). POWER_LAW: strain rate at which
+    /// eta = eta_N. COMPOSITE: transition strain rate at which Newtonian and power-law creep contribute equally.
+    /// Ignored when `strain_rate_law == NONE`.
+    double reference_strain_rate = 1e-15;
 
     /// Parameters for temperature- and depth-dependence of viscosity.
     /// Frank-Kamenetskii (FK) type laws -> eta = eta_ref * exp( -E_a ( T - x ) + V_a * depth ), with x either 0 (type 1), 0.5 (type 2) or T_mean(d) (type 3).
@@ -213,8 +236,9 @@ struct PhysicsParameters
     bool             compressible      = false;
     CompressibleForm compressible_form = CompressibleForm::TALA;
 
-    double calc_cm_per_year = 3e-4; // from non-dim velocity to cm/a
-    double calc_time_Ma     = 1e6;  // from non-dim time to Ma
+    double calc_cm_per_year       = 3e-4; // from non-dim velocity to cm/a
+    double calc_time_Ma           = 1e6;  // from non-dim time to Ma
+    double calc_strain_rate_per_s = 1.0;  // from non-dim strain rate to 1/s
 
     // Parameter radial profiles
     std::string density_profile_csv_path = "";
@@ -242,12 +266,45 @@ enum class MGPrecision
     HALF,
 };
 
+/// When to rebuild the viscosity-dependent parts of the Stokes preconditioner (coarse-level viscosities,
+/// smoother diagonals and spectra, Galerkin coarse-grid matrices, viscosity-weighted pressure mass matrix).
+///   AUTO   : only with a non-linear rheology (strain_rate_law != NONE), in every non-linear iteration. Default.
+///   NEVER  : keep the preconditioner that was set up with the initial radial viscosity profile.
+///   ALWAYS : like AUTO, and additionally for a linear rheology whenever the viscosity was updated.
+enum class PreconditionerRefresh
+{
+    AUTO,
+    NEVER,
+    ALWAYS,
+};
+
 struct StokesSolverParameters
 {
     int    krylov_restart            = 10;
     int    krylov_max_iterations     = 10;
     double krylov_relative_tolerance = 1e-6;
     double krylov_absolute_tolerance = 1e-12;
+
+    /// Non-linear (Picard / fixed-point) iteration for strain-rate dependent viscosity. Only active when
+    /// `strain_rate_law != NONE`. Each iteration recomputes the viscosity from the strain rate of the current
+    /// velocity and solves the resulting linear Stokes problem (starting from the current velocity).
+    /// The iteration stops as soon as the relative velocity change |u_k - u_{k-1}| / |u_k| of an iteration or
+    /// the relative non-linear residual |f - K(eta(u_k)) u_k| / |f| (l2 norms) drops below
+    /// `nonlinear_relative_tolerance`, or after `nonlinear_max_iterations` linear solves.
+    int    nonlinear_max_iterations     = 20;
+    double nonlinear_relative_tolerance = 1e-3;
+
+    /// Relaxation factor w of the non-linear iteration, applied to the logarithm of the strain rate invariant
+    /// the viscosity is evaluated with:  eps_used <- eps_used^(1-w) * eps_II(u)^w.
+    ///   w = 1 : plain Picard iteration. For a power law it converges linearly with a rate of ~ (n-1)/n per
+    ///           iteration (0.71 for n = 3.5), since the viscosity update only does a fraction 1/n of the way.
+    ///   w > 1 : over-relaxation (extrapolation). Speeds up the plain iteration for power-law rheologies;
+    ///           2 / (1 + 1/n) (1.56 for n = 3.5) is a safe choice, w must stay below 2.
+    ///   w < 1 : damping, for iterations that oscillate or diverge.
+    double nonlinear_relaxation = 1.0;
+
+    /// See PreconditionerRefresh.
+    PreconditionerRefresh pc_refresh = PreconditionerRefresh::AUTO;
 
     int viscous_pc_num_vcycles                 = 1;
     int viscous_pc_chebyshev_order             = 2;
@@ -444,6 +501,11 @@ inline void nondimensionalise( Parameters& prm )
         {
             phys.calc_time_Ma /= boundary.plate_parameters.plate_velocity_scaling;
         }
+
+        // Strain rates: the nondimensional unit is the inverse of the nondimensional time unit.
+        // 1 Ma = 1e6 * 365 d, consistent with calc_cm_per_year.
+        phys.calc_strain_rate_per_s = 1.0 / ( phys.calc_time_Ma * 1e6 * 365 * 24 * 60 * 60 );
+        phys.viscosity_parameters.reference_strain_rate /= phys.calc_strain_rate_per_s;
 
         // Nondimensionalise time
         time.t_end  = time.t_end_Ma / phys.calc_time_Ma;
@@ -754,6 +816,38 @@ inline util::Result< std::variant< CLIHelp, Parameters > > parse_parameters( int
     add_option_with_default( app, "--min-viscosity", parameters.physics_parameters.viscosity_parameters.min_viscosity )
         ->group( "Viscosity" );
 
+    // Non-linear (strain-rate dependent) rheology
+    std::map< std::string, StrainRateLaw > strain_rate_law_map{
+        { "none", StrainRateLaw::NONE },
+        { "power-law", StrainRateLaw::POWER_LAW },
+        { "composite", StrainRateLaw::COMPOSITE },
+    };
+
+    add_option_with_default(
+        app, "--viscosity-strain-rate-law", parameters.physics_parameters.viscosity_parameters.strain_rate_law )
+        ->transform( CLI::CheckedTransformer( strain_rate_law_map, CLI::ignore_case ) )
+        ->default_val( "none" )
+        ->group( "Viscosity" )
+        ->description(
+            "Strain-rate dependence of the viscosity (non-linear rheology), applied on top of --viscosity-law (eta_N). "
+            "'none': Newtonian (default). "
+            "'power-law': eta = eta_N * (eps_II / eps_0)^((1 - n) / n), with the second invariant of the strain rate eps_II, "
+            "eps_0 = --reference-strain-rate and n = --stress-exponent. "
+            "'composite': 1/eta = 1/eta_N + 1/eta_power-law (Newtonian and power-law creep acting simultaneously). "
+            "Viscosity limits apply. Makes the Stokes problem non-linear, see --stokes-nonlinear-*." );
+    add_option_with_default(
+        app, "--stress-exponent", parameters.physics_parameters.viscosity_parameters.stress_exponent )
+        ->check( CLI::Range( 1.0, 1e3 ) )
+        ->group( "Viscosity" )
+        ->description( "Stress exponent n >= 1 of the strain-rate dependence. n = 1 is Newtonian." );
+    add_option_with_default(
+        app, "--reference-strain-rate", parameters.physics_parameters.viscosity_parameters.reference_strain_rate )
+        ->check( CLI::PositiveNumber )
+        ->group( "Viscosity" )
+        ->description(
+            "Reference strain rate eps_0 in 1/s. 'power-law': strain rate at which eta = eta_N. "
+            "'composite': transition strain rate between Newtonian and power-law creep." );
+
     ///////////////////////////////
     /// Initial temperature      ///
     ///////////////////////////////
@@ -881,6 +975,47 @@ inline util::Result< std::variant< CLIHelp, Parameters > > parse_parameters( int
     add_option_with_default(
         app, "--stokes-krylov-absolute-tolerance", parameters.stokes_solver_parameters.krylov_absolute_tolerance )
         ->group( "Stokes Solver" );
+    add_option_with_default(
+        app, "--stokes-nonlinear-max-iterations", parameters.stokes_solver_parameters.nonlinear_max_iterations )
+        ->check( CLI::PositiveNumber )
+        ->group( "Stokes Solver" )
+        ->description(
+            "Maximum number of non-linear (Picard) iterations per Stokes solve. Each iteration updates the viscosity "
+            "from the current strain rate and solves the linear Stokes problem. "
+            "Only used with a non-linear rheology (--viscosity-strain-rate-law)." );
+    add_option_with_default(
+        app,
+        "--stokes-nonlinear-relative-tolerance",
+        parameters.stokes_solver_parameters.nonlinear_relative_tolerance )
+        ->check( CLI::NonNegativeNumber )
+        ->group( "Stokes Solver" )
+        ->description(
+            "The non-linear iteration stops once the relative velocity change |u_k - u_{k-1}| / |u_k| of an iteration "
+            "or the relative non-linear residual |f - K(eta(u_k)) u_k| / |f| drops below this." );
+    add_option_with_default(
+        app, "--stokes-nonlinear-relaxation", parameters.stokes_solver_parameters.nonlinear_relaxation )
+        ->check( CLI::Range( 0.01, 1.99 ) )
+        ->group( "Stokes Solver" )
+        ->description(
+            "Relaxation factor w of the non-linear iteration, applied to the logarithm of the strain rate the "
+            "viscosity is evaluated with. 1: plain Picard (default; converges with rate ~(n-1)/n per iteration for a "
+            "power law). > 1: over-relaxation, faster for power laws, 2/(1+1/n) is a safe choice (1.56 for n = 3.5). "
+            "< 1: damping." );
+    static const std::map< std::string, PreconditionerRefresh > pc_refresh_map{
+        { "auto", PreconditionerRefresh::AUTO },
+        { "never", PreconditionerRefresh::NEVER },
+        { "always", PreconditionerRefresh::ALWAYS },
+    };
+    add_option_with_default( app, "--stokes-pc-refresh", parameters.stokes_solver_parameters.pc_refresh )
+        ->transform( CLI::CheckedTransformer( pc_refresh_map, CLI::ignore_case ) )
+        ->default_val( "auto" )
+        ->group( "Stokes Solver" )
+        ->description(
+            "When to rebuild the viscosity-dependent parts of the Stokes preconditioner (coarse-level viscosities, "
+            "smoother diagonals, coarse-grid matrices, pressure mass matrix) from the current viscosity. "
+            "'auto': in every non-linear iteration, i.e., only with a non-linear rheology (default). "
+            "'never': keep the initial setup. "
+            "'always': also with a linear rheology, whenever the viscosity changed." );
     static const std::map< std::string, MGPrecision > mg_precision_map{
         { "double", MGPrecision::DOUBLE },
         { "float", MGPrecision::FLOAT },
